@@ -15,12 +15,12 @@ from langchain_openai import ChatOpenAI
 
 # ----------------------------- Page setup -----------------------------
 st.set_page_config(
-    page_title="One Night Study",
+    page_title="YouTube Learning Assistant",
     page_icon="🎓",
     layout="wide",
 )
 
-st.title("🎓 One Night Study")
+st.title("🎓 YouTube Learning Assistant")
 st.caption(
     "Find educational videos, combine their transcripts, and create summaries, "
     "notes, mind maps, flashcards, quizzes, and transcript-grounded answers."
@@ -92,13 +92,15 @@ def youtube_search(subject: str, topic: str, language: str, max_results: int = 5
             detail = response.text
         raise RuntimeError(f"YouTube API error ({response.status_code}): {detail}")
     items = response.json().get("items", [])
-    results = []
+    candidates = []
+    video_ids = []
     for item in items:
         video_id = item.get("id", {}).get("videoId")
         snippet = item.get("snippet", {})
         if not video_id:
             continue
-        results.append({
+        video_ids.append(video_id)
+        candidates.append({
             "video_id": video_id,
             "url": f"https://www.youtube.com/watch?v={video_id}",
             "title": snippet.get("title", "Untitled video"),
@@ -107,7 +109,45 @@ def youtube_search(subject: str, topic: str, language: str, max_results: int = 5
             "published_at": snippet.get("publishedAt", ""),
             "thumbnail": snippet.get("thumbnails", {}).get("medium", {}).get("url", ""),
         })
-    return results
+
+    # YouTube search.list does not include view/comment counts. Fetch public
+    # statistics via videos.list, then rank by views and comments.
+    stats_by_id = {}
+    if video_ids:
+        stats_response = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "statistics,contentDetails",
+                "id": ",".join(video_ids),
+                "key": YOUTUBE_API_KEY,
+            },
+            timeout=25,
+        )
+        if stats_response.status_code == 200:
+            for video in stats_response.json().get("items", []):
+                stats = video.get("statistics", {})
+                stats_by_id[video.get("id")] = {
+                    "view_count": int(stats.get("viewCount", 0) or 0),
+                    "comment_count": int(stats.get("commentCount", 0) or 0),
+                    "like_count": int(stats.get("likeCount", 0) or 0),
+                }
+
+    for video in candidates:
+        stats = stats_by_id.get(video["video_id"], {})
+        video.update({
+            "view_count": stats.get("view_count", 0),
+            "comment_count": stats.get("comment_count", 0),
+            "like_count": stats.get("like_count", 0),
+        })
+
+    # Rank by a transparent engagement score. Views matter most; comments add
+    # a smaller signal. These are absolute counts, so search relevance is still
+    # important because candidates are first found by the topic query.
+    candidates.sort(
+        key=lambda v: (v["view_count"] + 100 * v["comment_count"], v["view_count"]),
+        reverse=True,
+    )
+    return candidates
 
 @st.cache_data(ttl=60 * 60 * 24 * 7, show_spinner=False)
 def fetch_transcript_cached(video_id: str, api_key: str) -> str:
@@ -341,6 +381,11 @@ if recommended:
             with cols[1]:
                 st.markdown(f"**[{video['title']}]({video['url']})**")
                 st.caption(f"Channel: {video['channel']} · Published: {video.get('published_at', '')[:10]}")
+                st.caption(
+                    f"👁️ {video.get('view_count', 0):,} views · "
+                    f"💬 {video.get('comment_count', 0):,} comments · "
+                    f"👍 {video.get('like_count', 0):,} likes"
+                )
                 if video.get("description"):
                     st.write(video["description"][:240] + ("…" if len(video["description"]) > 240 else ""))
             with cols[2]:
@@ -353,20 +398,20 @@ if recommended:
                     selected_ids.append(video["video_id"])
 
     if st.button("Use selected recommendations", key="use_recommendations"):
-        chosen = [v["url"] for v in recommended if v["video_id"] in selected_ids]
-        st.session_state["selected_video_urls"] = chosen[:5]
+        chosen = [v["url"] for v in recommended if v["video_id"] in selected_ids][:5]
+        # Update keyed widget state before URL inputs are instantiated below.
+        for i in range(5):
+            st.session_state[f"video_url_{i}"] = chosen[i] if i < len(chosen) else ""
+        st.session_state["selected_video_urls"] = chosen
         st.rerun()
 
 # ----------------------------- Video URL input -----------------------------
 st.subheader("2. Add up to five YouTube videos")
-prefill = st.session_state.get("selected_video_urls", [])
 with st.form("video_form"):
     url_inputs = []
     for i in range(5):
-        default_value = prefill[i] if i < len(prefill) else ""
         url_inputs.append(st.text_input(
             f"YouTube URL {i + 1}",
-            value=default_value,
             placeholder="https://www.youtube.com/watch?v=...",
             key=f"video_url_{i}",
         ))

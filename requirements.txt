@@ -10,6 +10,7 @@ langchain-text-splitters
 langchain-huggingface
 langchain-community
 langchain-openrouter
+langchain-openai
 
 sentence-transformers
 faiss-cpu

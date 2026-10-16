@@ -1,1002 +1,815 @@
 
 import os
 import re
-import json
-import sqlite3
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
-
+import requests
+import time
 import streamlit as st
-import fitz
-from openai import OpenAI
-from youtube_transcript_api import YouTubeTranscriptApi
+
+from urllib.parse import urlparse, parse_qs
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_openrouter import ChatOpenRouter
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-PROJECT_DIR = Path(__file__).parent
-DATA_DIR = PROJECT_DIR / "app_data"
-DATA_DIR.mkdir(exist_ok=True)
-
-DB_PATH = DATA_DIR / "app.db"
+# ==================================================
+# PAGE CONFIG
+# ==================================================
 
 st.set_page_config(
-    page_title="Lecture to Revision AI",
-    page_icon="🎓",
-    layout="wide"
+    page_title="YouTube RAG Chatbot",
+    page_icon="🎥",
+    layout="wide",
 )
 
 
-# =========================================================
-# CUSTOM UI
-# =========================================================
+# ==================================================
+# DARK THEME
+# ==================================================
 
-st.markdown("""
-<style>
-.stApp {
-    background: linear-gradient(135deg, #0b1020, #14112b);
-    color: #f4f4ff;
-}
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #0e1117;
+        color: #fafafa;
+    }
 
-[data-testid="stSidebar"] {
-    background: #10152a;
-}
+    [data-testid="stSidebar"] {
+        background-color: #161b22;
+    }
 
-h1, h2, h3 {
-    color: #c4b5fd;
-}
+    .main-title {
+        font-size: 2.4rem;
+        font-weight: 750;
+    }
 
-.stButton button {
-    background: linear-gradient(90deg, #6d5dfc, #4387f5);
-    color: white;
-    border: 0;
-    border-radius: 10px;
-}
+    .subtitle {
+        color: #aab4c3;
+        margin-bottom: 1.5rem;
+    }
 
-div[data-testid="stChatMessage"] {
-    border: 1px solid #35345a;
-    border-radius: 12px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    .stButton button {
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-with db() as conn:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT,
-            title TEXT,
-            content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+st.markdown(
+    '<div class="main-title">🎥 YouTube RAG Chatbot</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div class="subtitle">'
+    'Paste a YouTube URL and ask questions about the video.'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 
-def save_document(source, title, content):
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO documents (source, title, content)
-            VALUES (?, ?, ?)
-            """,
-            (source, title, content)
-        )
+# ==================================================
+# EXTRACT YOUTUBE VIDEO ID
+# ==================================================
 
+def extract_video_id(url):
+    url = url.strip()
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().split(":")[0]
 
-def load_documents():
-    with db() as conn:
-        return [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM documents ORDER BY id DESC"
-            ).fetchall()
-        ]
+    if host in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/").split("/")[0]
 
-
-# =========================================================
-# OPENROUTER LLM
-# =========================================================
-
-def get_client():
-    key = None
-
-    try:
-        key = st.secrets.get("OPENROUTER_API_KEY")
-    except Exception:
-        key = os.getenv("OPENROUTER_API_KEY")
-
-    if not key:
-        st.error(
-            "OpenRouter API key is missing. Add "
-            "OPENROUTER_API_KEY to Streamlit Cloud Secrets."
-        )
-        st.stop()
-
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=key
-    )
-
-
-def ask_model(system_prompt, user_prompt):
-    client = get_client()
-
-    model = os.getenv(
-        "OPENROUTER_MODEL",
-        "openai/gpt-4o-mini"
-    )
-
-    try:
-        model = st.secrets.get("OPENROUTER_MODEL", model)
-    except Exception:
-        pass
-
-    result = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ]
-    )
-
-    return result.choices[0].message.content or ""
-
-
-# =========================================================
-# YOUTUBE URL VALIDATION
-# =========================================================
-
-def youtube_id(url):
-    parsed = urlparse(url.strip())
-    host = (parsed.hostname or "").lower()
-
-    video_id = None
-
-    if host in {
+    elif host in {
         "youtube.com",
         "www.youtube.com",
         "m.youtube.com",
-        "music.youtube.com"
+        "music.youtube.com",
     }:
         if parsed.path == "/watch":
             video_id = parse_qs(
                 parsed.query
-            ).get("v", [None])[0]
+            ).get("v", [""])[0]
 
         elif parsed.path.startswith(
             ("/embed/", "/shorts/", "/live/")
         ):
-            segments = parsed.path.strip("/").split("/")
+            parts = parsed.path.strip("/").split("/")
+            video_id = parts[1] if len(parts) > 1 else ""
 
-            if len(segments) >= 2:
-                video_id = segments[1]
+        else:
+            video_id = ""
 
-    elif host in {"youtu.be", "www.youtu.be"}:
-        video_id = parsed.path.strip("/").split("/")[0]
+    else:
+        video_id = ""
 
-    if not video_id or not re.fullmatch(
-        r"[A-Za-z0-9_-]{11}", video_id
-    ):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         raise ValueError(
-            "Enter a valid YouTube video URL."
+            "Invalid YouTube URL. Paste a valid video link."
         )
 
     return video_id
 
 
-# =========================================================
-# YOUTUBE TRANSCRIPT RETRIEVAL
-# =========================================================
+# ==================================================
+# FETCH TRANSCRIPT THROUGH HOSTED API
+# ==================================================
 
-def transcript_text(url, language):
-    vid = youtube_id(url)
+def _supadata_request(path, params=None, timeout=60):
+    """Call Supadata using the API key stored in Streamlit Secrets."""
+    try:
+        api_key = st.secrets.get("SUPADATA_API_KEY", "")
+    except Exception:
+        api_key = os.environ.get("SUPADATA_API_KEY", "")
+    api_key = api_key or os.environ.get("SUPADATA_API_KEY", "")
 
-    codes = {
-        "English": ["en"],
-        "Hindi": ["hi", "en"],
-        "Marathi": ["mr", "hi", "en"]
+    if not api_key:
+        raise RuntimeError(
+            "SUPADATA_API_KEY is missing. Add it in Streamlit Cloud → "
+            "Settings → Secrets."
+        )
+
+    response = requests.get(
+        f"https://api.supadata.ai/v1{path}",
+        headers={"x-api-key": api_key},
+        params=params,
+        timeout=timeout,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"message": response.text[:500]}
+
+    if not response.ok:
+        message = data.get("message") or data.get("error") or str(data)
+        if response.status_code == 401:
+            message = "Supadata API key is invalid. " + str(message)
+        elif response.status_code == 402:
+            message = "Supadata credits may be exhausted. " + str(message)
+        elif response.status_code == 429:
+            message = "Supadata rate limit reached. " + str(message)
+        raise RuntimeError(f"Supadata HTTP {response.status_code}: {message}")
+    return data
+
+
+def _poll_supadata_job(job_id, timeout_seconds=180):
+    """Wait for a Supadata asynchronous transcript job."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        time.sleep(2)
+        result = _supadata_request(f"/transcript/{job_id}")
+        status = str(result.get("status", "")).lower()
+        if status in {"completed", "complete", "success", "succeeded"}:
+            return result.get("result", result)
+        if status in {"failed", "error"}:
+            raise RuntimeError(
+                "Supadata transcript job failed: "
+                + str(result.get("error") or result.get("message") or "unknown error")
+            )
+    raise TimeoutError("Supadata transcript job timed out. Please try again.")
+
+
+def _parse_supadata_response(data):
+    """Normalize transcript response data into timestamped segments."""
+    payload = data.get("result", data) if isinstance(data, dict) else data
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            raise RuntimeError("Supadata returned an empty transcript.")
+        return [{"text": text, "start": 0.0, "end": 0.0}], "auto"
+
+    content = payload.get("content", []) if isinstance(payload, dict) else payload
+    language = (
+        payload.get("lang") or payload.get("language")
+        or data.get("lang", data.get("language", "auto"))
+    ) if isinstance(payload, dict) and isinstance(data, dict) else "auto"
+
+    if isinstance(content, str):
+        content = [{"text": content, "start": 0, "duration": 0}]
+
+    segments = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                text, start, end = item.strip(), 0.0, 0.0
+            elif isinstance(item, dict):
+                text = str(item.get("text", "")).strip()
+                start = float(item.get("start", item.get("offset", 0)) or 0)
+                duration = float(item.get("duration", 0) or 0)
+                end = float(item.get("end", start + duration) or (start + duration))
+                # Offsets may be supplied in milliseconds.
+                if start > 100000:
+                    start /= 1000
+                if end > 100000:
+                    end /= 1000
+            else:
+                continue
+            if text:
+                segments.append({"text": text, "start": start, "end": end})
+
+    if not segments:
+        raise RuntimeError("Supadata returned no usable transcript segments.")
+    return segments, language
+
+
+def _fetch_supadata_transcript(video_url, mode, language="en"):
+    params = {"url": video_url, "text": "true", "mode": mode}
+    if language and language != "auto":
+        params["lang"] = language
+    data = _supadata_request("/transcript", params=params)
+    if isinstance(data, dict) and data.get("jobId"):
+        data = _poll_supadata_job(data["jobId"])
+    return _parse_supadata_response(data)
+
+
+def fetch_youtube_transcript(video_id):
+    """Fetch captions first, then request provider-side AI audio transcription."""
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    errors = []
+
+    # First attempt: retrieve existing captions.
+    try:
+        return _fetch_supadata_transcript(video_url, mode="native", language="en")
+    except Exception as error:
+        errors.append(f"Caption retrieval: {error}")
+
+    # Fallback: ask Supadata to generate a transcript from the video's audio.
+    # This does not require the user to upload a transcript or audio file.
+    try:
+        return _fetch_supadata_transcript(video_url, mode="generate", language="en")
+    except Exception as error:
+        errors.append(f"AI audio transcription: {error}")
+
+    raise RuntimeError(
+        "Could not retrieve captions or generate a transcript. Check that the "
+        "video is publicly accessible, SUPADATA_API_KEY is valid, and credits "
+        "are available. Details: " + " | ".join(errors)
+    )
+
+
+# ==================================================
+# EMBEDDINGS
+# ==================================================
+
+@st.cache_resource(show_spinner="Loading embedding model...")
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name=(
+            "sentence-transformers/"
+            "paraphrase-multilingual-MiniLM-L12-v2"
+        )
+    )
+
+
+# ==================================================
+# BUILD VECTOR INDEX
+# ==================================================
+
+def build_index(video_url):
+    video_id = extract_video_id(video_url)
+
+    segments, language = fetch_youtube_transcript(video_id)
+
+    # Keep all transcript segments for full-video summaries.
+    full_text_parts = []
+    segment_ranges = []
+    position = 0
+
+    for segment in segments:
+        text = segment["text"]
+
+        segment_ranges.append(
+            {
+                "char_start": position,
+                "char_end": position + len(text),
+                "start": segment["start"],
+                "end": segment["end"],
+            }
+        )
+
+        full_text_parts.append(text)
+        position += len(text) + 1
+
+    full_text = " ".join(full_text_parts)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    chunks = splitter.split_text(full_text)
+
+    if not chunks:
+        raise RuntimeError(
+            "Could not split the transcript into chunks."
+        )
+
+    documents = []
+    search_position = 0
+
+    for index, chunk in enumerate(chunks):
+        chunk_start = full_text.find(
+            chunk, search_position
+        )
+
+        if chunk_start == -1:
+            chunk_start = full_text.find(chunk)
+
+        if chunk_start == -1:
+            chunk_start = 0
+
+        chunk_end = chunk_start + len(chunk)
+
+        search_position = max(
+            chunk_start + 1,
+            chunk_end - 150,
+        )
+
+        overlapping = [
+            item for item in segment_ranges
+            if (
+                item["char_end"] >= chunk_start
+                and item["char_start"] <= chunk_end
+            )
+        ]
+
+        if overlapping:
+            start_seconds = int(overlapping[0]["start"])
+            end_seconds = int(overlapping[-1]["end"])
+        else:
+            start_seconds = 0
+            end_seconds = 0
+
+        documents.append(
+            Document(
+                page_content=chunk,
+                metadata={
+                    "video_id": video_id,
+                    "chunk_index": index,
+                    "start_seconds": start_seconds,
+                    "end_seconds": end_seconds,
+                    "language": language,
+                },
+            )
+        )
+
+    vectorstore = FAISS.from_documents(
+        documents,
+        get_embeddings(),
+    )
+
+    return {
+        "video_id": video_id,
+        "video_url": (
+            f"https://www.youtube.com/watch?v={video_id}"
+        ),
+        "language": language,
+        "segment_count": len(segments),
+        "chunk_count": len(documents),
+        "vectorstore": vectorstore,
+        "documents": documents,
     }
 
-    try:
-        api = YouTubeTranscriptApi()
 
-        transcript = api.fetch(
-            vid,
-            languages=codes[language]
-        )
+# ==================================================
+# OPENROUTER LLM
+# ==================================================
 
-        parts = []
+def get_llm():
+    api_key = os.environ.get("OPENROUTER_API_KEY")
 
-        for item in transcript:
-            text = item.text.strip()
-
-            if text:
-                timestamp = int(item.start)
-
-                parts.append(
-                    f"[{timestamp // 60:02d}:"
-                    f"{timestamp % 60:02d}] {text}"
-                )
-
-        if not parts:
-            raise ValueError(
-                "No transcript text was found."
+    if not api_key:
+        try:
+            api_key = st.secrets.get(
+                "OPENROUTER_API_KEY"
             )
+        except Exception:
+            api_key = None
 
-        return vid, "\n".join(parts)
-
-    except Exception as exc:
+    if not api_key:
         raise RuntimeError(
-            "Automatic transcript retrieval failed. YouTube may be "
-            "blocking the app's cloud IP, or captions may be unavailable "
-            "in the selected language. Try another language or upload a "
-            "TXT/SRT transcript below. Details: "
-            + str(exc)[:300]
-        ) from exc
-
-
-# =========================================================
-# MANUAL TRANSCRIPT FILE PROCESSING
-# =========================================================
-
-def transcript_file_text(upload):
-    filename = upload.name.lower()
-
-    try:
-        text = upload.getvalue().decode("utf-8-sig").strip()
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            "Could not decode the file. Save it as UTF-8 text "
-            "and upload it again."
-        ) from exc
-
-    if not text:
-        raise ValueError("The transcript file is empty.")
-
-    if filename.endswith(".srt"):
-        # Remove SRT subtitle sequence numbers.
-        text = re.sub(
-            r"(?m)^\s*\d+\s*$",
-            "",
-            text
+            "OPENROUTER_API_KEY is missing. "
+            "Configure it in Streamlit Cloud Secrets."
         )
 
-        # Remove SRT timestamps.
-        text = re.sub(
-            r"(?m)^\s*\d{2}:\d{2}:\d{2}[,.]\d{3}"
-            r"\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}"
-            r".*$",
-            "",
-            text
-        )
-
-        # Remove common WebVTT-style tags if present.
-        text = re.sub(r"<[^>]+>", "", text)
-
-    # Normalize excess whitespace without joining every line.
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-
-    if not text:
-        raise ValueError(
-            "No readable transcript text was found."
-        )
-
-    return text
-
-
-# =========================================================
-# PDF PROCESSING
-# =========================================================
-
-def pdf_text(upload):
-    doc = fitz.open(
-        stream=upload.getvalue(),
-        filetype="pdf"
+    return ChatOpenRouter(
+        model="openai/gpt-4o-mini",
+        api_key=api_key,
+        temperature=0,
     )
 
-    pages = []
 
-    for number, page in enumerate(doc, start=1):
-        text = page.get_text().strip()
+# ==================================================
+# QUESTION ANSWERING PROMPT
+# ==================================================
 
-        if text:
-            pages.append(
-                f"[Page {number}]\n{text}"
-            )
+qa_prompt = ChatPromptTemplate.from_template(
+    """
+You are an intelligent YouTube video assistant.
 
-    doc.close()
+Answer using the transcript context provided below.
 
-    if not pages:
-        raise ValueError(
-            "No selectable text found in this PDF. "
-            "Scanned PDFs may require OCR."
-        )
+Rules:
+- Answer the question directly and clearly.
+- Use all relevant information in the context.
+- For broad questions, give a useful answer based on
+  the available evidence.
+- Do not invent facts or pretend to know content absent
+  from the transcript.
+- If some information is missing, answer the parts you
+  can and briefly explain the limitation.
+- Use headings or bullet points when useful.
+- Do not include source links.
 
-    return "\n\n".join(pages)
+Transcript context:
+{context}
 
+Question:
+{question}
 
-# =========================================================
-# TEXT CHUNKING AND RETRIEVAL
-# =========================================================
-
-def split_chunks(text, size=1100, overlap=150):
-    text = re.sub(r"\s+", " ", text).strip()
-
-    chunks = []
-    start = 0
-
-    while start < len(text):
-        end = min(start + size, len(text))
-        chunks.append(text[start:end])
-
-        if end == len(text):
-            break
-
-        start = end - overlap
-
-    return chunks
-
-
-def retrieve(text, query, count=5):
-    chunks = split_chunks(text)
-
-    terms = set(
-        re.findall(r"\w+", query.lower())
-    )
-
-    scored = []
-
-    for chunk in chunks:
-        words = re.findall(
-            r"\w+",
-            chunk.lower()
-        )
-
-        wordset = set(words)
-
-        score = sum(
-            1 for term in terms
-            if term in wordset
-        )
-
-        if score:
-            scored.append((score, chunk))
-
-    scored.sort(
-        key=lambda item: item[0],
-        reverse=True
-    )
-
-    return [
-        chunk for _, chunk in scored[:count]
-    ]
-
-
-# =========================================================
-# APPLICATION HEADER AND SIDEBAR
-# =========================================================
-
-st.title("🎓 Lecture to Revision AI")
-
-st.caption(
-    "Turn lectures and PDFs into revision notes, "
-    "answers and practice."
+Answer:
+"""
 )
 
+
+# ==================================================
+# FULL VIDEO SUMMARY
+# ==================================================
+
+def summarize_entire_video(documents, llm, batch_size=8):
+    """
+    Summarize every transcript chunk in batches, then combine
+    the partial summaries into a final text-only answer.
+    """
+
+    if not documents:
+        return "No transcript content is available."
+
+    partial_summaries = []
+
+    total_batches = (
+        len(documents) + batch_size - 1
+    ) // batch_size
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for start in range(0, len(documents), batch_size):
+        batch = documents[start:start + batch_size]
+
+        batch_context = "\n\n".join(
+            doc.page_content for doc in batch
+        )
+
+        batch_prompt = ChatPromptTemplate.from_template(
+            """
+Summarize this portion of a YouTube transcript.
+
+Capture the key ideas, explanations, examples, facts,
+and conclusions. Do not invent information.
+
+This is part {part_number} of {total_parts} of the video.
+Preserve important details that may be needed in the
+final summary.
+
+Transcript:
+{context}
+
+Partial summary:
+"""
+        )
+
+        chain = batch_prompt | llm
+
+        result = chain.invoke(
+            {
+                "context": batch_context,
+                "part_number": (
+                    start // batch_size + 1
+                ),
+                "total_parts": total_batches,
+            }
+        )
+
+        partial_summaries.append(result.content)
+
+        completed = min(
+            start + batch_size, len(documents)
+        )
+
+        progress.progress(
+            completed / len(documents)
+        )
+
+        status.caption(
+            f"Summarizing transcript: "
+            f"{completed}/{len(documents)} chunks"
+        )
+
+    progress.empty()
+    status.empty()
+
+    # Hierarchical reduction prevents the final prompt from
+    # growing indefinitely for very long videos.
+    current_summaries = partial_summaries
+
+    while len(current_summaries) > 1:
+        next_summaries = []
+
+        for start in range(0, len(current_summaries), 4):
+            group = current_summaries[start:start + 4]
+
+            if len(group) == 1:
+                next_summaries.append(group[0])
+                continue
+
+            combined = "\n\n".join(group)
+
+            reduce_prompt = ChatPromptTemplate.from_template(
+                """
+Combine these partial summaries into one coherent summary.
+
+Preserve the important facts, key topics, examples, and
+conclusions. Remove repetition without losing meaningful
+information. Do not introduce unsupported facts.
+
+Partial summaries:
+{summaries}
+
+Combined summary:
+"""
+            )
+
+            chain = reduce_prompt | llm
+
+            result = chain.invoke(
+                {"summaries": combined}
+            )
+
+            next_summaries.append(result.content)
+
+        current_summaries = next_summaries
+
+    final_prompt = ChatPromptTemplate.from_template(
+        """
+Write a comprehensive summary of the complete YouTube video.
+
+Include:
+1. The main topic and purpose.
+2. Major points in their original progression.
+3. Important explanations and examples.
+4. Key conclusions and takeaways.
+
+Use clear headings and bullet points. Keep the summary
+informative rather than excessively repetitive. Do not
+invent information.
+
+Video summaries:
+{summaries}
+
+Final summary:
+"""
+    )
+
+    result = (
+        final_prompt | llm
+    ).invoke(
+        {"summaries": current_summaries[0]}
+    )
+
+    return result.content
+
+
+# ==================================================
+# URL-ONLY SIDEBAR
+# ==================================================
+
 with st.sidebar:
-    st.header("⚙️ Study settings")
+    st.header("🎬 Video Input")
 
-    language = st.selectbox(
-        "Response language",
-        ["English", "Hindi", "Marathi"]
+    video_url = st.text_input(
+        "Paste YouTube video URL",
+        placeholder="https://www.youtube.com/watch?v=...",
+    )
+
+    process_button = st.button(
+        "Process Video",
+        type="primary",
+        use_container_width=True,
     )
 
     st.divider()
 
     st.caption(
-        "Study materials are stored in this app's local database. "
-        "On Streamlit Cloud, local storage may not be permanent."
+        "Paste a video URL, process its transcript, "
+        "and ask questions."
     )
 
 
-# =========================================================
-# TABS
-# =========================================================
+# ==================================================
+# SESSION STATE
+# ==================================================
 
-tab_add, tab_study, tab_notes, tab_cards, tab_quiz = st.tabs([
-    "📥 Add material",
-    "💬 Ask AI",
-    "📝 Revision notes",
-    "🃏 Flashcards",
-    "✅ MCQ practice"
-])
+defaults = {
+    "messages": [],
+    "vectorstore": None,
+    "documents": [],
+    "video_id": None,
+    "video_url": None,
+    "video_language": None,
+    "segment_count": 0,
+    "chunk_count": 0,
+}
 
-
-# =========================================================
-# TAB 1: ADD MATERIAL
-# =========================================================
-
-with tab_add:
-
-    # -----------------------------------------------------
-    # YOUTUBE VIDEO
-    # -----------------------------------------------------
-
-    st.subheader("Add a YouTube lecture")
-
-    url = st.text_input(
-        "YouTube URL",
-        placeholder="https://www.youtube.com/watch?v=..."
-    )
-
-    if st.button("Process YouTube lecture"):
-        try:
-            with st.spinner("Fetching transcript..."):
-                vid, text = transcript_text(
-                    url,
-                    language
-                )
-
-                save_document(
-                    "youtube",
-                    vid,
-                    text
-                )
-
-            st.success(
-                f"Transcript indexed successfully "
-                f"({len(text):,} characters)."
-            )
-
-            st.rerun()
-
-        except Exception as exc:
-            st.error(
-                f"Could not process this video: {exc}"
-            )
-
-            st.info(
-                "If YouTube is blocking automatic retrieval, "
-                "use the transcript upload option below."
-            )
-
-    # -----------------------------------------------------
-    # MANUAL TRANSCRIPT UPLOAD
-    # -----------------------------------------------------
-
-    st.divider()
-
-    st.subheader("Upload a transcript instead")
-
-    st.caption(
-        "Use this option if automatic YouTube transcript retrieval "
-        "fails. Supported formats: TXT and SRT."
-    )
-
-    transcript_file = st.file_uploader(
-        "Choose a transcript file",
-        type=["txt", "srt"],
-        key="transcript_upload"
-    )
-
-    if transcript_file and st.button(
-        "Process transcript file"
-    ):
-        try:
-            with st.spinner("Processing transcript..."):
-                text = transcript_file_text(
-                    transcript_file
-                )
-
-                save_document(
-                    "transcript_upload",
-                    transcript_file.name,
-                    text
-                )
-
-            st.success(
-                f"Transcript imported successfully "
-                f"({len(text):,} characters)."
-            )
-
-            st.rerun()
-
-        except Exception as exc:
-            st.error(
-                f"Could not process transcript file: {exc}"
-            )
-
-    # -----------------------------------------------------
-    # PDF UPLOAD
-    # -----------------------------------------------------
-
-    st.divider()
-
-    st.subheader("Upload a PDF")
-
-    uploaded = st.file_uploader(
-        "Choose a text-based PDF",
-        type=["pdf"],
-        key="pdf_upload"
-    )
-
-    if uploaded and st.button("Process PDF"):
-        try:
-            with st.spinner("Extracting PDF text..."):
-                text = pdf_text(uploaded)
-
-                save_document(
-                    "pdf",
-                    uploaded.name,
-                    text
-                )
-
-            st.success(
-                f"PDF processed ({len(text):,} characters)."
-            )
-
-            st.rerun()
-
-        except Exception as exc:
-            st.error(
-                f"Could not process PDF: {exc}"
-            )
-
-    # -----------------------------------------------------
-    # INDEXED MATERIALS
-    # -----------------------------------------------------
-
-    st.divider()
-
-    st.subheader("Indexed materials")
-
-    documents = load_documents()
-
-    if not documents:
-        st.info(
-            "No materials yet. Add a YouTube lecture, "
-            "transcript, or PDF above."
-        )
-
-    for doc in documents:
-        st.markdown(
-            f"**{doc['title']}** · {doc['source']}"
-        )
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
-# =========================================================
-# TAB 2: ASK AI
-# =========================================================
+# ==================================================
+# PROCESS VIDEO
+# ==================================================
 
-with tab_study:
-
-    st.subheader(
-        "Ask questions about your material"
-    )
-
-    documents = load_documents()
-
-    if not documents:
-        st.info(
-            "Add a lecture, transcript, or PDF first."
+if process_button:
+    if not video_url.strip():
+        st.sidebar.warning(
+            "Please paste a YouTube URL."
         )
 
     else:
-        options = {
-            f"{d['title']} · {d['source']} · #{d['id']}": d
-            for d in documents
-        }
+        try:
+            with st.spinner(
+                "Fetching transcript and building the index..."
+            ):
+                result = build_index(video_url)
 
-        selected_label = st.selectbox(
-            "Choose material",
-            list(options)
-        )
+            st.session_state.vectorstore = result["vectorstore"]
+            st.session_state.documents = result["documents"]
+            st.session_state.video_id = result["video_id"]
+            st.session_state.video_url = result["video_url"]
+            st.session_state.video_language = result["language"]
+            st.session_state.segment_count = result["segment_count"]
+            st.session_state.chunk_count = result["chunk_count"]
+            st.session_state.messages = []
 
-        selected = options[selected_label]
-
-        if "chat" not in st.session_state:
-            st.session_state.chat = []
-
-        # Keep conversation history separate for each document.
-        chat_key = f"chat_{selected['id']}"
-
-        if chat_key not in st.session_state:
-            st.session_state[chat_key] = []
-
-        for message in st.session_state[chat_key]:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-
-        question = st.chat_input(
-            "Ask a question about this lecture..."
-        )
-
-        if question:
-            relevant = retrieve(
-                selected["content"],
-                question
+            st.success(
+                "Video processed successfully! "
+                "You can now ask questions."
             )
 
-            context = "\n\n".join(relevant)
+        except Exception as error:
+            st.error(str(error))
 
-            if not context:
-                st.warning(
-                    "No matching passage found. "
-                    "Try different keywords."
+
+# ==================================================
+# VIDEO INFORMATION
+# ==================================================
+
+if st.session_state.vectorstore is not None:
+    st.success("✅ Video indexed and ready.")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Transcript segments",
+        st.session_state.segment_count,
+    )
+
+    col2.metric(
+        "Search chunks",
+        st.session_state.chunk_count,
+    )
+
+    col3.metric(
+        "Language",
+        st.session_state.video_language,
+    )
+
+    st.video(st.session_state.video_url)
+
+    st.divider()
+
+
+# ==================================================
+# DISPLAY CHAT HISTORY — TEXT ONLY
+# ==================================================
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+
+# ==================================================
+# CHAT INPUT AND ANSWERS
+# ==================================================
+
+question = st.chat_input(
+    "Ask anything about the video..."
+)
+
+if question:
+    if st.session_state.vectorstore is None:
+        st.warning(
+            "Please paste and process a YouTube URL first."
+        )
+
+    else:
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
+
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            try:
+                llm = get_llm()
+
+                question_lower = question.lower()
+
+                summary_keywords = [
+                    "summary",
+                    "summarize",
+                    "summarise",
+                    "overview",
+                    "main points",
+                    "key points",
+                    "what is this video about",
+                    "explain the video",
+                    "recap",
+                ]
+
+                is_summary_question = any(
+                    keyword in question_lower
+                    for keyword in summary_keywords
                 )
 
-            else:
-                st.session_state[chat_key].append(
+                if is_summary_question:
+                    with st.spinner(
+                        "Creating a summary of the entire video..."
+                    ):
+                        answer = summarize_entire_video(
+                            st.session_state.documents,
+                            llm,
+                            batch_size=8,
+                        )
+
+                else:
+                    with st.spinner(
+                        "Searching the transcript..."
+                    ):
+                        retrieved_docs = (
+                            st.session_state.vectorstore
+                            .similarity_search(
+                                question,
+                                k=min(
+                                    12,
+                                    len(st.session_state.documents),
+                                ),
+                            )
+                        )
+
+                        context = "\n\n".join(
+                            doc.page_content
+                            for doc in retrieved_docs
+                        )
+
+                    with st.spinner(
+                        "Generating answer..."
+                    ):
+                        chain = qa_prompt | llm
+
+                        response = chain.invoke(
+                            {
+                                "context": context,
+                                "question": question,
+                            }
+                        )
+
+                        answer = response.content
+
+                # Display only the answer.
+                st.markdown(answer)
+
+                # Store text only; no sources or links.
+                st.session_state.messages.append(
                     {
-                        "role": "user",
-                        "content": question
+                        "role": "assistant",
+                        "content": answer,
                     }
                 )
 
-                with st.chat_message("user"):
-                    st.markdown(question)
-
-                with st.chat_message("assistant"):
-                    with st.spinner(
-                        "Finding evidence and preparing an answer..."
-                    ):
-                        try:
-                            answer = ask_model(
-                                "You are a student revision assistant. "
-                                "Answer only from the supplied evidence. "
-                                f"Respond in {language}. "
-                                "If evidence is insufficient, say so. "
-                                "Do not invent facts, citations, "
-                                "or timestamps.",
-
-                                f"Evidence:\n{context}\n\n"
-                                f"Question: {question}"
-                            )
-
-                            st.markdown(answer)
-
-                            st.session_state[chat_key].append(
-                                {
-                                    "role": "assistant",
-                                    "content": answer
-                                }
-                            )
-
-                            with st.expander(
-                                "Retrieved source passages"
-                            ):
-                                for i, chunk in enumerate(
-                                    relevant, 1
-                                ):
-                                    st.markdown(
-                                        f"**Source {i}**"
-                                    )
-                                    st.write(chunk)
-
-                        except Exception as exc:
-                            st.error(
-                                f"Answer generation failed: {exc}"
-                            )
-
-
-# =========================================================
-# TAB 3: REVISION NOTES
-# =========================================================
-
-with tab_notes:
-
-    st.subheader("Generate revision notes")
-
-    documents = load_documents()
-
-    if documents:
-        options = {
-            f"{d['title']} · #{d['id']}": d
-            for d in documents
-        }
-
-        label = st.selectbox(
-            "Material for notes",
-            list(options),
-            key="notes_doc"
-        )
-
-        doc = options[label]
-
-        if st.button("Generate notes"):
-            with st.spinner(
-                "Creating student-friendly notes..."
-            ):
-                try:
-                    chunks = split_chunks(
-                        doc["content"]
-                    )
-
-                    context = "\n\n".join(
-                        chunks[:15]
-                    )
-
-                    notes = ask_model(
-                        "Create clear revision notes in "
-                        + language
-                        + ". Use headings, definitions, key points "
-                        "and a recap. Use only the supplied material.",
-                        context
-                    )
-
-                    st.session_state.latest_notes = notes
-
-                except Exception as exc:
-                    st.error(
-                        f"Could not generate notes: {exc}"
-                    )
-
-        if st.session_state.get("latest_notes"):
-            st.markdown(
-                st.session_state.latest_notes
-            )
-
-            st.download_button(
-                "Download notes as Markdown",
-                st.session_state.latest_notes,
-                file_name="revision_notes.md",
-                mime="text/markdown"
-            )
-
-    else:
-        st.info(
-            "Add a lecture, transcript, or PDF first."
-        )
-
-
-# =========================================================
-# TAB 4: FLASHCARDS
-# =========================================================
-
-with tab_cards:
-
-    st.subheader("Create flashcards")
-
-    documents = load_documents()
-
-    if documents:
-        options = {
-            f"{d['title']} · #{d['id']}": d
-            for d in documents
-        }
-
-        label = st.selectbox(
-            "Material for cards",
-            list(options),
-            key="cards_doc"
-        )
-
-        doc = options[label]
-
-        count = st.slider(
-            "Number of cards",
-            3,
-            20,
-            10
-        )
-
-        if st.button("Generate flashcards"):
-            try:
-                with st.spinner(
-                    "Creating flashcards..."
-                ):
-                    raw = ask_model(
-                        "Create educational flashcards from the material. "
-                        "Respond in "
-                        + language
-                        + ". Return valid JSON only: an array of objects "
-                        "with keys question and answer. "
-                        "Do not invent facts.",
-
-                        f"Create {count} flashcards from:\n"
-                        + "\n\n".join(
-                            split_chunks(doc["content"])[:15]
-                        )
-                    )
-
-                    raw = re.sub(
-                        r"^```(?:json)?\s*|\s*```$",
-                        "",
-                        raw.strip()
-                    )
-
-                    cards = json.loads(raw)
-
-                    if not isinstance(cards, list):
-                        raise ValueError(
-                            "The model did not return a JSON array."
-                        )
-
-                    st.session_state.cards = cards[:count]
-
-            except Exception as exc:
+            except Exception as error:
                 st.error(
-                    f"Could not create flashcards: {exc}"
+                    f"Could not generate an answer: {error}"
                 )
-
-        for i, card in enumerate(
-            st.session_state.get("cards", []), 1
-        ):
-            with st.expander(
-                f"Card {i}: {card.get('question', 'Question')}"
-            ):
-                st.write(
-                    card.get("answer", "")
-                )
-
-    else:
-        st.info(
-            "Add a lecture, transcript, or PDF first."
-        )
-
-
-# =========================================================
-# TAB 5: MCQ PRACTICE
-# =========================================================
-
-with tab_quiz:
-
-    st.subheader(
-        "Practice with multiple-choice questions"
-    )
-
-    documents = load_documents()
-
-    if documents:
-        options = {
-            f"{d['title']} · #{d['id']}": d
-            for d in documents
-        }
-
-        label = st.selectbox(
-            "Material for quiz",
-            list(options),
-            key="quiz_doc"
-        )
-
-        doc = options[label]
-
-        count = st.slider(
-            "Number of questions",
-            3,
-            15,
-            5
-        )
-
-        if st.button("Generate MCQ quiz"):
-            try:
-                with st.spinner(
-                    "Preparing your quiz..."
-                ):
-                    raw = ask_model(
-                        "Create multiple-choice questions in "
-                        + language
-                        + " based only on the material. "
-                        "Return valid JSON only, an array with "
-                        "question, options (four strings), "
-                        "correct_answer and explanation. "
-                        "correct_answer must exactly match an option.",
-
-                        f"Create {count} questions from:\n"
-                        + "\n\n".join(
-                            split_chunks(doc["content"])[:15]
-                        )
-                    )
-
-                    raw = re.sub(
-                        r"^```(?:json)?\s*|\s*```$",
-                        "",
-                        raw.strip()
-                    )
-
-                    quiz = json.loads(raw)
-
-                    if not isinstance(quiz, list):
-                        raise ValueError(
-                            "The model did not return a JSON array."
-                        )
-
-                    st.session_state.quiz = quiz[:count]
-
-            except Exception as exc:
-                st.error(
-                    f"Could not generate quiz: {exc}"
-                )
-
-        if st.session_state.get("quiz"):
-            with st.form("quiz_form"):
-                answers = {}
-
-                for i, q in enumerate(
-                    st.session_state.quiz
-                ):
-                    st.markdown(
-                        f"**{i + 1}. {q['question']}**"
-                    )
-
-                    answers[i] = st.radio(
-                        "Choose an answer",
-                        q["options"],
-                        key=f"quiz_answer_{i}",
-                        index=None
-                    )
-
-                submitted = st.form_submit_button(
-                    "Check answers"
-                )
-
-            if submitted:
-                score = 0
-
-                for i, q in enumerate(
-                    st.session_state.quiz
-                ):
-                    correct = (
-                        answers[i] == q["correct_answer"]
-                    )
-
-                    score += int(correct)
-
-                    st.markdown(
-                        f"**Question {i + 1}:** "
-                        + (
-                            "✅ Correct"
-                            if correct
-                            else (
-                                "❌ Correct answer: "
-                                + str(q["correct_answer"])
-                            )
-                        )
-                    )
-
-                    st.caption(
-                        q.get("explanation", "")
-                    )
-
-                st.metric(
-                    "Your score",
-                    f"{score}/{len(st.session_state.quiz)}"
-                )
-
-    else:
-        st.info(
-            "Add a lecture, transcript, or PDF first."
-        )
-
-
-# =========================================================
-# FOOTER
-# =========================================================
-
-st.divider()
-
-st.caption(
-    "Lecture to Revision AI · Verify important answers "
-    "against the original material."
-)

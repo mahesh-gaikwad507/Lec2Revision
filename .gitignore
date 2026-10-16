@@ -1,0 +1,20 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+secrets.toml
+
+# Local databases and user data
+*.db
+*.sqlite
+*.sqlite3
+app_data/
+database/
+
+# Python and notebook cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/

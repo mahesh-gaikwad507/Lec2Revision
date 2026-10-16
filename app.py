@@ -15,12 +15,12 @@ from langchain_openai import ChatOpenAI
 
 # ----------------------------- Page setup -----------------------------
 st.set_page_config(
-    page_title="YouTube Learning Assistant",
+    page_title="One Night Study",
     page_icon="🎓",
     layout="wide",
 )
 
-st.title("🎓 YouTube Learning Assistant")
+st.title("🎓 One Night Study")
 st.caption(
     "Find educational videos, combine their transcripts, and create summaries, "
     "notes, mind maps, flashcards, quizzes, and transcript-grounded answers."

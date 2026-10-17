@@ -1,180 +1,133 @@
+
 import os
 import re
 import json
 import time
-import math
-import hmac
-import hashlib
-import secrets
-import smtplib
+import random
 import sqlite3
-from pathlib import Path
-from datetime import datetime, timedelta
+import smtplib
+import hashlib
 from email.message import EmailMessage
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import bcrypt
-import faiss
-import numpy as np
 import requests
 import streamlit as st
 from pypdf import PdfReader
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
-from youtube_transcript_api import YouTubeTranscriptApi
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# ---------------------------------------------------------
-# APP CONFIGURATION
-# ---------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "lecture_revision.db"
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("LTR_DATA_DIR", APP_DIR / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-DB_PATH = DATA_DIR / "lecture_revision.db"
+APP_NAME = "Lecture-to-Revision AI"
+DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 st.set_page_config(
-    page_title="Lecture-to-Revision AI",
+    page_title=APP_NAME,
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ============================================================
+# THEME
+# ============================================================
 
-def get_secret(name, default=""):
-    """Read a key from Streamlit Secrets or environment variables."""
-    try:
-        value = st.secrets.get(name, default)
-        if value:
-            return str(value)
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = get_secret(
-    "OPENROUTER_MODEL", "openai/gpt-4o-mini"
-)
-YOUTUBE_API_KEY = get_secret("YOUTUBE_API_KEY")
-SMTP_HOST = get_secret("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(get_secret("SMTP_PORT", "587"))
-SMTP_USERNAME = get_secret("SMTP_USERNAME")
-SMTP_PASSWORD = get_secret("SMTP_PASSWORD")
-SMTP_FROM_EMAIL = get_secret("SMTP_FROM_EMAIL", SMTP_USERNAME)
-
-EMBEDDING_MODEL_NAME = get_secret(
-    "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-
-
-# ---------------------------------------------------------
-# STYLING
-# ---------------------------------------------------------
-
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
-
-    html, body, [class*="css"] {
-        font-family: 'DM Sans', sans-serif;
-    }
-
-    .stApp {
-        background:
-          radial-gradient(circle at 8% 0%, rgba(91, 92, 246, .10), transparent 30%),
-          radial-gradient(circle at 100% 10%, rgba(20, 184, 166, .08), transparent 25%);
-    }
-
-    h1, h2, h3 {
-        font-family: 'Manrope', sans-serif;
-        letter-spacing: -0.035em;
-    }
-
-    .hero {
-        padding: 1.5rem 0 1rem 0;
-    }
-
-    .hero-kicker {
-        color: #7776f6;
-        text-transform: uppercase;
-        letter-spacing: .14em;
-        font-size: .76rem;
-        font-weight: 800;
-    }
-
-    .hero-title {
-        font-family: 'Manrope', sans-serif;
-        font-size: clamp(2rem, 4vw, 3.4rem);
-        font-weight: 800;
-        line-height: 1.1;
-        margin: .45rem 0;
-    }
-
-    .hero-subtitle {
-        color: #777f90;
-        font-size: 1.05rem;
-        max-width: 720px;
-    }
-
-    .panel {
-        border: 1px solid rgba(130, 140, 165, .22);
-        background: rgba(128, 128, 128, .035);
-        border-radius: 18px;
-        padding: 1.1rem;
-        margin: .3rem 0 .8rem 0;
-    }
-
-    .metric {
-        border: 1px solid rgba(130, 140, 165, .22);
-        border-radius: 16px;
-        padding: 1rem;
-        background: rgba(128, 128, 128, .035);
-    }
-
-    .muted { color: #7b8495; }
-    div.stButton > button {
-        border-radius: 10px;
-        font-weight: 650;
-        min-height: 2.6rem;
-    }
-    div[data-testid="stForm"] {
-        border: 1px solid rgba(130, 140, 165, .2);
-        border-radius: 16px;
-        padding: 1.1rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+.stApp {
+    background: #0d111b;
+    color: #f5f7fb;
+}
+[data-testid="stSidebar"] {
+    background: #141a29;
+}
+h1, h2, h3 {
+    color: #ffffff;
+}
+.stButton > button {
+    background: #ff4b55;
+    color: white;
+    border: 0;
+    border-radius: 9px;
+    min-height: 42px;
+    font-weight: 600;
+}
+.stButton > button:hover {
+    background: #e83b47;
+    color: white;
+}
+.stTextInput input, .stTextArea textarea,
+.stSelectbox div[data-baseweb="select"] {
+    border-radius: 8px;
+}
+.hero {
+    padding: 26px;
+    border-radius: 16px;
+    background: linear-gradient(120deg, #202944, #38233d);
+    margin-bottom: 20px;
+}
+.muted {
+    color: #aeb8ca;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
-# ---------------------------------------------------------
+# ============================================================
 # DATABASE
-# ---------------------------------------------------------
+# Existing database is retained. Tables are created if missing.
+# ============================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
 def init_db():
     with db() as conn:
-        conn.executescript(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password_hash BLOB NOT NULL,
                 verified INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS email_codes (
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS revision_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                subject TEXT,
+                topic TEXT,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS otp_codes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL,
                 purpose TEXT NOT NULL,
@@ -182,206 +135,185 @@ def init_db():
                 expires_at TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS materials (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                source_name TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS chats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                role TEXT NOT NULL,
-                message TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS study_progress (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                subject TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                activity_type TEXT NOT NULL,
-                score REAL,
-                details TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_materials_user
-                ON materials(user_id, subject, topic);
-
-            CREATE INDEX IF NOT EXISTS idx_chats_user
-                ON chats(user_id, subject, topic, created_at);
-
-            CREATE INDEX IF NOT EXISTS idx_codes_email
-                ON email_codes(email, purpose, created_at);
-            """
-        )
+            )
+        """)
 
 
 init_db()
 
 
-# ---------------------------------------------------------
-# GENERAL UTILITIES
-# ---------------------------------------------------------
+# ============================================================
+# SECRETS / ENVIRONMENT
+# ============================================================
 
-def now_iso():
-    return datetime.utcnow().isoformat(timespec="seconds")
-
-
-def normalize_email(email):
-    return email.strip().lower()
-
-
-def valid_email(email):
-    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email))
+def setting(name, default=""):
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return default
 
 
-def valid_password(password):
-    return len(password) >= 10
+def utcnow():
+    return datetime.utcnow()
+
+
+def now_text():
+    return utcnow().isoformat(timespec="seconds")
+
+
+def get_user_by_email(email):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE lower(email)=lower(?)",
+            (email.strip(),)
+        ).fetchone()
+
+
+def get_user_by_username(username):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE lower(username)=lower(?)",
+            (username.strip(),)
+        ).fetchone()
+
+
+# ============================================================
+# PASSWORDS
+# Required change: maximum of 8 characters.
+# NOTE: This is less secure than permitting longer passwords.
+# ============================================================
+
+def validate_password(password):
+    if not password:
+        return False, "Please enter a password."
+
+    if len(password) > 8:
+        return False, "Password must be at most 8 characters."
+
+    if len(password) < 1:
+        return False, "Password cannot be empty."
+
+    return True, ""
 
 
 def hash_password(password):
-    return bcrypt.hashpw(
-        password.encode("utf-8"), bcrypt.gensalt()
-    ).decode("utf-8")
+    valid, message = validate_password(password)
+    if not valid:
+        raise ValueError(message)
+
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
 
 
-def check_password(password, hashed):
+def check_password(password, stored_hash):
     try:
         return bcrypt.checkpw(
-            password.encode("utf-8"), hashed.encode("utf-8")
+            password.encode("utf-8"),
+            bytes(stored_hash)
         )
     except (ValueError, TypeError):
         return False
 
 
-def add_progress(user_id, subject, topic, activity, score=None, details=""):
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO study_progress
-            (user_id, subject, topic, activity_type, score, details, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id, subject, topic, activity,
-                score, details, now_iso()
-            ),
-        )
-
-
-# ---------------------------------------------------------
+# ============================================================
 # EMAIL OTP
-# ---------------------------------------------------------
+# Configure SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD,
+# SMTP_FROM, and OTP_PEPPER in Streamlit secrets.
+# ============================================================
 
 def send_email(to_email, subject, body):
-    if not all([SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_EMAIL]):
+    host = setting("SMTP_HOST")
+    port = int(setting("SMTP_PORT", "587"))
+    username = setting("SMTP_USER")
+    password = setting("SMTP_PASSWORD")
+    sender = setting("SMTP_FROM", username)
+
+    if not all([host, username, password, sender]):
         raise RuntimeError(
-            "Email is not configured. Add SMTP settings to Streamlit Secrets."
+            "Email is not configured. Add SMTP_HOST, SMTP_USER, "
+            "SMTP_PASSWORD and SMTP_FROM to Streamlit secrets."
         )
 
     msg = EmailMessage()
-    msg["From"] = SMTP_FROM_EMAIL
-    msg["To"] = to_email
     msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to_email
     msg.set_content(body)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+    with smtplib.SMTP(host, port, timeout=20) as server:
         server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.login(username, password)
         server.send_message(msg)
 
 
-def issue_email_code(email, purpose):
-    email = normalize_email(email)
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    expires = (datetime.utcnow() + timedelta(minutes=10)).isoformat(
-        timespec="seconds"
-    )
-
-    # Use a keyed hash so the OTP is not stored as plaintext.
-    pepper = get_secret("OTP_PEPPER")
+def otp_digest(email, purpose, code):
+    pepper = setting("OTP_PEPPER")
     if not pepper:
-        raise RuntimeError(
-            "OTP_PEPPER is missing from configuration. "
-            "Set it to a long random secret."
-        )
+        raise RuntimeError("OTP_PEPPER is not configured.")
+    raw = f"{email.lower()}|{purpose}|{code}|{pepper}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
-    code_hash = hmac.new(
-        pepper.encode(),
-        f"{email}:{purpose}:{code}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
 
+def create_and_send_otp(email, purpose):
+    # Basic cooldown: do not send another code for 60 seconds.
     with db() as conn:
-        conn.execute(
-            "DELETE FROM email_codes WHERE email=? AND purpose=?",
-            (email, purpose),
+        recent = conn.execute("""
+            SELECT created_at FROM otp_codes
+            WHERE lower(email)=lower(?) AND purpose=?
+            ORDER BY id DESC LIMIT 1
+        """, (email, purpose)).fetchone()
+
+        if recent:
+            try:
+                created = datetime.fromisoformat(recent["created_at"])
+                if (utcnow() - created).total_seconds() < 60:
+                    raise ValueError(
+                        "Please wait 60 seconds before requesting another code."
+                    )
+            except ValueError:
+                raise
+
+        code = f"{random.SystemRandom().randint(0, 999999):06d}"
+        digest = otp_digest(email, purpose, code)
+        expires = (utcnow() + timedelta(minutes=10)).isoformat(
+            timespec="seconds"
         )
-        conn.execute(
-            """
-            INSERT INTO email_codes
+
+        conn.execute("""
+            INSERT INTO otp_codes
             (email, purpose, code_hash, expires_at, attempts, created_at)
             VALUES (?, ?, ?, ?, 0, ?)
-            """,
-            (email, purpose, code_hash, expires, now_iso()),
-        )
-
-    subject = (
-        "Your Lecture-to-Revision verification code"
-        if purpose == "verify"
-        else "Reset your Lecture-to-Revision password"
-    )
-
-    body = (
-        f"Your verification code is: {code}\n\n"
-        "This code expires in 10 minutes. If you did not request it, "
-        "you can ignore this email."
-    )
+        """, (email, purpose, digest, expires, now_text()))
 
     try:
-        send_email(email, subject, body)
+        send_email(
+            email,
+            f"{APP_NAME} verification code",
+            f"Your verification code is {code}.\n\n"
+            "It expires in 10 minutes. Do not share this code."
+        )
     except Exception:
+        # Remove the unusable code if delivery fails.
         with db() as conn:
-            conn.execute(
-                "DELETE FROM email_codes WHERE email=? AND purpose=?",
-                (email, purpose),
-            )
+            conn.execute("""
+                DELETE FROM otp_codes
+                WHERE lower(email)=lower(?) AND purpose=?
+            """, (email, purpose))
         raise
 
 
-def verify_email_code(email, purpose, code):
-    email = normalize_email(email)
-    pepper = get_secret("OTP_PEPPER")
-    if not pepper:
-        return False, "Email verification is not configured."
+def verify_otp(email, purpose, code):
+    if not re.fullmatch(r"\d{6}", code.strip()):
+        return False, "Enter the 6-digit code."
 
     with db() as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM email_codes
-            WHERE email=? AND purpose=?
+        row = conn.execute("""
+            SELECT * FROM otp_codes
+            WHERE lower(email)=lower(?) AND purpose=?
             ORDER BY id DESC LIMIT 1
-            """,
-            (email, purpose),
-        ).fetchone()
+        """, (email.strip(), purpose)).fetchone()
 
         if not row:
             return False, "Request a new verification code."
@@ -389,269 +321,67 @@ def verify_email_code(email, purpose, code):
         if row["attempts"] >= 5:
             return False, "Too many attempts. Request a new code."
 
-        if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
-            conn.execute("DELETE FROM email_codes WHERE id=?", (row["id"],))
-            return False, "This code has expired. Request another."
-
-        expected = hmac.new(
-            pepper.encode(),
-            f"{email}:{purpose}:{code.strip()}".encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        expires = datetime.fromisoformat(row["expires_at"])
+        if utcnow() > expires:
+            conn.execute("DELETE FROM otp_codes WHERE id=?", (row["id"],))
+            return False, "Code expired. Request a new one."
 
         conn.execute(
-            "UPDATE email_codes SET attempts=attempts+1 WHERE id=?",
-            (row["id"],),
+            "UPDATE otp_codes SET attempts=attempts+1 WHERE id=?",
+            (row["id"],)
         )
 
-        if not hmac.compare_digest(expected, row["code_hash"]):
-            return False, "Incorrect code."
+        expected = row["code_hash"]
+        actual = otp_digest(email.strip(), purpose, code.strip())
 
-        conn.execute("DELETE FROM email_codes WHERE id=?", (row["id"],))
-        return True, "Verified."
+        if not hashlib.compare_digest(expected, actual):
+            return False, "Incorrect verification code."
 
-
-# ---------------------------------------------------------
-# AUTHENTICATION
-# ---------------------------------------------------------
-
-def current_user():
-    user_id = st.session_state.get("user_id")
-    if not user_id:
-        return None
-
-    with db() as conn:
-        return conn.execute(
-            "SELECT id, email, username, verified FROM users WHERE id=?",
-            (user_id,),
-        ).fetchone()
+        conn.execute("DELETE FROM otp_codes WHERE id=?", (row["id"],))
+        return True, "Email verified."
 
 
-def auth_screen():
-    st.markdown(
-        """
-        <div class="hero">
-          <div class="hero-kicker">Your personal AI study companion</div>
-          <div class="hero-title">Learn smarter.<br>Revise with confidence.</div>
-          <div class="hero-subtitle">
-            Turn lecture videos and PDFs into summaries, flashcards,
-            practice questions and searchable study notes.
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# ============================================================
+# OPENROUTER AI
+# Configure OPENROUTER_API_KEY and optionally OPENROUTER_MODEL.
+# ============================================================
 
-    login_tab, signup_tab, verify_tab, reset_tab = st.tabs(
-        ["Log in", "Create account", "Verify email", "Forgot password"]
-    )
-
-    with login_tab:
-        with st.form("login_form"):
-            email = st.text_input("Email", key="login_email")
-            password = st.text_input(
-                "Password", type="password", key="login_password"
-            )
-            submitted = st.form_submit_button(
-                "Log in", type="primary", use_container_width=True
-            )
-
-        if submitted:
-            email = normalize_email(email)
-            with db() as conn:
-                user = conn.execute(
-                    "SELECT * FROM users WHERE email=?", (email,)
-                ).fetchone()
-
-            if user and check_password(password, user["password_hash"]):
-                if not user["verified"]:
-                    st.warning("Verify your email before logging in.")
-                else:
-                    st.session_state.user_id = user["id"]
-                    st.rerun()
-            else:
-                st.error("Email or password is incorrect.")
-
-    with signup_tab:
-        with st.form("signup_form"):
-            username = st.text_input("Username", max_chars=30)
-            email = st.text_input("Email address", key="signup_email")
-            password = st.text_input(
-                "Password (at least 10 characters)",
-                type="password",
-                key="signup_password",
-            )
-            confirm = st.text_input(
-                "Confirm password", type="password"
-            )
-            submitted = st.form_submit_button(
-                "Create account", type="primary", use_container_width=True
-            )
-
-        if submitted:
-            email = normalize_email(email)
-            username = username.strip()
-
-            if not re.fullmatch(r"[A-Za-z0-9_.-]{3,30}", username):
-                st.error("Username must be 3–30 characters: letters, digits, . _ -")
-            elif not valid_email(email):
-                st.error("Enter a valid email address.")
-            elif not valid_password(password):
-                st.error("Use a password with at least 10 characters.")
-            elif password != confirm:
-                st.error("Passwords do not match.")
-            else:
-                try:
-                    with db() as conn:
-                        conn.execute(
-                            """
-                            INSERT INTO users
-                            (email, username, password_hash, verified, created_at)
-                            VALUES (?, ?, ?, 0, ?)
-                            """,
-                            (email, username, hash_password(password), now_iso()),
-                        )
-                    st.session_state.pending_verification_email = email
-                    issue_email_code(email, "verify")
-                    st.success(
-                        "Account created. Check your email for the six-digit code."
-                    )
-                except sqlite3.IntegrityError:
-                    st.error("That email or username is already registered.")
-                except Exception as exc:
-                    st.error(f"Could not send verification email: {exc}")
-
-    with verify_tab:
-        st.caption("Verify a new account using the code sent to your email.")
-        email = st.text_input(
-            "Account email", key="verify_email",
-            value=st.session_state.get("pending_verification_email", "")
-        )
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Send / resend code", use_container_width=True):
-                email = normalize_email(email)
-                with db() as conn:
-                    user = conn.execute(
-                        "SELECT verified FROM users WHERE email=?", (email,)
-                    ).fetchone()
-                if not valid_email(email) or not user:
-                    st.error("No account found for that email.")
-                elif user["verified"]:
-                    st.info("This account is already verified.")
-                else:
-                    try:
-                        issue_email_code(email, "verify")
-                        st.success("A new code has been sent.")
-                    except Exception as exc:
-                        st.error(f"Email could not be sent: {exc}")
-
-        with col2:
-            code = st.text_input("Six-digit code", max_chars=6, key="verify_code")
-            if st.button("Verify account", type="primary", use_container_width=True):
-                email = normalize_email(email)
-                ok, message = verify_email_code(email, "verify", code)
-                if ok:
-                    with db() as conn:
-                        conn.execute(
-                            "UPDATE users SET verified=1 WHERE email=?", (email,)
-                        )
-                    st.success("Email verified. You can now log in.")
-                else:
-                    st.error(message)
-
-    with reset_tab:
-        st.caption("Request a password-reset code for your registered email.")
-        email = normalize_email(
-            st.text_input("Registered email", key="reset_email")
-        )
-
-        if st.button("Send reset code", use_container_width=True):
-            with db() as conn:
-                user = conn.execute(
-                    "SELECT id FROM users WHERE email=?", (email,)
-                ).fetchone()
-
-            # Do not reveal whether an account exists.
-            if user and valid_email(email):
-                try:
-                    issue_email_code(email, "reset")
-                except Exception:
-                    pass
-            st.info(
-                "If the account exists and email is configured, "
-                "a reset code will be sent."
-            )
-
-        code = st.text_input("Reset code", max_chars=6, key="reset_code")
-        new_password = st.text_input(
-            "New password (at least 10 characters)",
-            type="password", key="new_password"
-        )
-        confirm_password = st.text_input(
-            "Confirm new password", type="password", key="new_password_confirm"
-        )
-
-        if st.button("Reset password", type="primary", use_container_width=True):
-            if not valid_email(email):
-                st.error("Enter the email address used for the account.")
-            elif not valid_password(new_password):
-                st.error("Use a password with at least 10 characters.")
-            elif new_password != confirm_password:
-                st.error("Passwords do not match.")
-            else:
-                ok, message = verify_email_code(email, "reset", code)
-                if ok:
-                    with db() as conn:
-                        conn.execute(
-                            "UPDATE users SET password_hash=? WHERE email=?",
-                            (hash_password(new_password), email),
-                        )
-                    st.success("Password reset successfully. Please log in.")
-                else:
-                    st.error(message)
-
-
-# ---------------------------------------------------------
-# AI MODEL AND OPENROUTER
-# ---------------------------------------------------------
-
-@st.cache_resource(show_spinner="Loading the embedding model...")
-def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-
-def call_ai(system_prompt, user_prompt, temperature=0.3, max_tokens=1800):
-    if not OPENROUTER_API_KEY:
+def ai_generate(prompt, system_prompt=None, temperature=0.3):
+    api_key = setting("OPENROUTER_API_KEY")
+    if not api_key:
         raise RuntimeError(
-            "OPENROUTER_API_KEY is not configured in Streamlit Secrets."
+            "OPENROUTER_API_KEY is missing from Streamlit secrets."
         )
+
+    model = setting("OPENROUTER_MODEL", DEFAULT_MODEL)
 
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8501",
-            "X-Title": "Lecture-to-Revision AI",
+            "HTTP-Referer": setting("APP_URL", "http://localhost:8501"),
+            "X-Title": APP_NAME,
         },
         json={
-            "model": OPENROUTER_MODEL,
+            "model": model,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": system_prompt or
+                    "You are a careful tutor. Use clear headings and accurate explanations."
+                },
+                {"role": "user", "content": prompt},
             ],
             "temperature": temperature,
-            "max_tokens": max_tokens,
         },
         timeout=120,
     )
 
     if not response.ok:
         raise RuntimeError(
-            f"OpenRouter error ({response.status_code}): "
-            f"{response.text[:700]}"
+            f"AI provider returned HTTP {response.status_code}: "
+            f"{response.text[:500]}"
         )
 
     data = response.json()
@@ -661,706 +391,821 @@ def call_ai(system_prompt, user_prompt, temperature=0.3, max_tokens=1800):
         raise RuntimeError("The AI provider returned an unexpected response.")
 
 
-def split_chunks(text, chunk_size=1100, overlap=180):
+# ============================================================
+# PDF AND YOUTUBE INGESTION
+# ============================================================
+
+def extract_pdf(uploaded_file):
+    reader = PdfReader(uploaded_file)
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append(f"[Page {page_number}]\n{text}")
+
+    return "\n\n".join(pages)
+
+
+def youtube_video_id(url):
+    patterns = [
+        r"(?:youtube\.com/watch\?v=)([\w-]{11})",
+        r"(?:youtu\.be/)([\w-]{11})",
+        r"(?:youtube\.com/embed/)([\w-]{11})",
+        r"(?:youtube\.com/shorts/)([\w-]{11})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def extract_youtube_transcript(url, language="en"):
+    video_id = youtube_video_id(url)
+    if not video_id:
+        raise ValueError("That doesn't look like a valid YouTube video URL.")
+
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+
+        api = YouTubeTranscriptApi()
+        transcript = api.fetch(video_id, languages=[language, "en"])
+        parts = []
+
+        for item in transcript:
+            if hasattr(item, "text"):
+                parts.append(item.text)
+            elif isinstance(item, dict) and item.get("text"):
+                parts.append(item["text"])
+
+        text = " ".join(parts).strip()
+        if not text:
+            raise RuntimeError("The transcript is empty.")
+
+        return text
+
+    except ImportError:
+        raise RuntimeError(
+            "Install a compatible youtube-transcript-api package."
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not retrieve the transcript. It may be disabled, "
+            "unavailable for this language, or blocked by YouTube. "
+            f"Details: {str(exc)[:250]}"
+        )
+
+
+def split_chunks(text, chunk_size=1200, overlap=150):
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
 
     chunks = []
     start = 0
+
     while start < len(text):
-        end = min(len(text), start + chunk_size)
-        piece = text[start:end].strip()
-        if piece:
-            chunks.append(piece)
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+
         if end == len(text):
             break
+
         start = max(end - overlap, start + 1)
+
     return chunks
 
 
-def retrieve_context(query, documents, top_k=5):
-    """Combine dense semantic retrieval with BM25 keyword retrieval."""
-    documents = [d.strip() for d in documents if d and d.strip()]
-    if not documents:
-        return []
+def ingest_uploaded_material(uploaded_file, source_type, language="en"):
+    if source_type == "PDF":
+        return extract_pdf(uploaded_file)
 
-    tokenized = [re.findall(r"\w+", d.lower()) for d in documents]
-    bm25 = BM25Okapi(tokenized)
-    query_tokens = re.findall(r"\w+", query.lower())
-    lexical_scores = np.asarray(bm25.get_scores(query_tokens), dtype=np.float32)
+    if source_type == "YouTube":
+        return extract_youtube_transcript(uploaded_file, language)
 
-    model = load_embedding_model()
-    doc_vectors = model.encode(
-        documents, normalize_embeddings=True, convert_to_numpy=True
-    ).astype("float32")
-    query_vector = model.encode(
-        [query], normalize_embeddings=True, convert_to_numpy=True
-    ).astype("float32")
-
-    index = faiss.IndexFlatIP(doc_vectors.shape[1])
-    index.add(doc_vectors)
-    dense_scores, dense_ids = index.search(
-        query_vector, min(top_k * 2, len(documents))
-    )
-
-    # Reciprocal-rank fusion combines keyword and semantic rankings.
-    fused = {}
-    for rank, idx in enumerate(dense_ids[0], start=1):
-        if idx >= 0:
-            fused[int(idx)] = fused.get(int(idx), 0) + 1 / (60 + rank)
-
-    lexical_order = np.argsort(lexical_scores)[::-1][:top_k * 2]
-    for rank, idx in enumerate(lexical_order, start=1):
-        fused[int(idx)] = fused.get(int(idx), 0) + 1 / (60 + rank)
-
-    ordered = sorted(fused, key=fused.get, reverse=True)[:top_k]
-    return [documents[i] for i in ordered]
+    raise ValueError("Unsupported source type.")
 
 
-# ---------------------------------------------------------
-# PDF AND YOUTUBE INGESTION
-# ---------------------------------------------------------
+# ============================================================
+# REVISION HISTORY
+# ============================================================
 
-def extract_pdf_text(uploaded_file):
-    reader = PdfReader(uploaded_file)
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return "\n".join(pages).strip()
-
-
-def extract_youtube_id(url):
-    patterns = [
-        r"(?:youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
-        r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
-        r"(?:youtube\.com/embed/)([A-Za-z0-9_-]{11})",
-        r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
-
-def fetch_youtube_transcript(url):
-    video_id = extract_youtube_id(url)
-    if not video_id:
-        raise ValueError("This does not look like a valid YouTube video URL.")
-
-    # youtube-transcript-api 0.x interface
-    transcript = YouTubeTranscriptApi.get_transcript(
-        video_id, languages=["en", "hi"]
-    )
-    return " ".join(item.get("text", "") for item in transcript).strip()
-
-
-def search_youtube_videos(query, max_results=5):
-    if not YOUTUBE_API_KEY:
-        raise RuntimeError("YOUTUBE_API_KEY is not configured.")
-
-    response = requests.get(
-        "https://www.googleapis.com/youtube/v3/search",
-        params={
-            "part": "snippet",
-            "q": query,
-            "type": "video",
-            "maxResults": min(max_results, 10),
-            "key": YOUTUBE_API_KEY,
-        },
-        timeout=30,
-    )
-    if not response.ok:
-        raise RuntimeError(
-            f"YouTube search error ({response.status_code}): "
-            f"{response.text[:500]}"
-        )
-
-    items = response.json().get("items", [])
-    ids = [
-        item.get("id", {}).get("videoId")
-        for item in items
-        if item.get("id", {}).get("videoId")
-    ]
-
-    stats = {}
-    if ids:
-        stat_response = requests.get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            params={
-                "part": "statistics,contentDetails",
-                "id": ",".join(ids),
-                "key": YOUTUBE_API_KEY,
-            },
-            timeout=30,
-        )
-        if stat_response.ok:
-            stats = {
-                item["id"]: item
-                for item in stat_response.json().get("items", [])
-            }
-
-    results = []
-    for item in items:
-        video_id = item.get("id", {}).get("videoId")
-        if not video_id:
-            continue
-        snippet = item.get("snippet", {})
-        stat = stats.get(video_id, {}).get("statistics", {})
-        results.append({
-            "title": snippet.get("title", "Untitled video"),
-            "channel": snippet.get("channelTitle", "Unknown channel"),
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-            "views": int(stat.get("viewCount", 0)),
-            "likes": int(stat.get("likeCount", 0)),
-            "comments": int(stat.get("commentCount", 0)),
-            "description": snippet.get("description", ""),
-        })
-    return results
-
-
-def save_material(user_id, subject, topic, source_type, source_name, content):
-    if not content or len(content.strip()) < 40:
-        raise ValueError("The extracted text is too short to save.")
-
+def save_revision(user_id, subject, topic, kind, content):
     with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO materials
-            (user_id, subject, topic, source_type, source_name, content, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id, subject.strip(), topic.strip(), source_type,
-                source_name[:500], content, now_iso()
-            ),
-        )
-
-
-def load_materials(user_id, subject, topic):
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, source_type, source_name, content, created_at
-            FROM materials
-            WHERE user_id=? AND subject=? AND topic=?
-            ORDER BY id DESC
-            """,
-            (user_id, subject, topic),
-        ).fetchall()
-    return rows
-
-
-def delete_material(user_id, material_id):
-    with db() as conn:
-        conn.execute(
-            "DELETE FROM materials WHERE id=? AND user_id=?",
-            (material_id, user_id),
-        )
-
-
-# ---------------------------------------------------------
-# SAVED CHAT HISTORY
-# ---------------------------------------------------------
-
-def save_chat(user_id, subject, topic, role, message):
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO chats
-            (user_id, subject, topic, role, message, created_at)
+        conn.execute("""
+            INSERT INTO revision_history
+            (user_id, subject, topic, kind, content, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, subject, topic, role, message, now_iso()),
+        """, (
+            user_id, subject, topic, kind, content, now_text()
+        ))
+
+
+def get_revisions(user_id, limit=100):
+    with db() as conn:
+        return conn.execute("""
+            SELECT * FROM revision_history
+            WHERE user_id=?
+            ORDER BY id DESC LIMIT ?
+        """, (user_id, limit)).fetchall()
+
+
+def save_chat(user_id, question, answer):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO chat_history
+            (user_id, question, answer, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, question, answer, now_text()))
+
+
+def get_chats(user_id, limit=100):
+    with db() as conn:
+        return conn.execute("""
+            SELECT * FROM chat_history
+            WHERE user_id=?
+            ORDER BY id DESC LIMIT ?
+        """, (user_id, limit)).fetchall()
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if "source_text" not in st.session_state:
+    st.session_state.source_text = ""
+
+if "source_name" not in st.session_state:
+    st.session_state.source_name = ""
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "auth_tab" not in st.session_state:
+    st.session_state.auth_tab = "Log in"
+
+
+# ============================================================
+# AUTHENTICATION UI
+# ============================================================
+
+def register_account(username, email, password, confirm):
+    username = username.strip()
+    email = email.strip().lower()
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]{3,30}", username):
+        raise ValueError(
+            "Username must be 3–30 characters using letters, digits, "
+            "periods, underscores or hyphens."
         )
 
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise ValueError("Enter a valid email address.")
 
-def load_chat(user_id, subject, topic, limit=100):
+    valid, message = validate_password(password)
+    if not valid:
+        raise ValueError(message)
+
+    valid, message = validate_password(confirm)
+    if not valid:
+        raise ValueError("Confirmation password must be at most 8 characters.")
+
+    if password != confirm:
+        raise ValueError("Passwords do not match.")
+
+    if get_user_by_username(username):
+        raise ValueError("That username is already registered.")
+
+    if get_user_by_email(email):
+        raise ValueError("That email address is already registered.")
+
+    password_hash = hash_password(password)
+
     with db() as conn:
-        return conn.execute(
-            """
-            SELECT role, message, created_at
-            FROM chats
-            WHERE user_id=? AND subject=? AND topic=?
-            ORDER BY id DESC LIMIT ?
-            """,
-            (user_id, subject, topic, limit),
-        ).fetchall()[::-1]
+        conn.execute("""
+            INSERT INTO users
+            (username, email, password_hash, verified, created_at)
+            VALUES (?, ?, ?, 0, ?)
+        """, (username, email, password_hash, now_text()))
+
+    st.session_state.pending_email = email
+    create_and_send_otp(email, "verify")
+    return True
 
 
-# ---------------------------------------------------------
-# REVISION GENERATION
-# ---------------------------------------------------------
+def authenticate(username, password):
+    user = get_user_by_username(username)
+    if not user:
+        return None, "Invalid username or password."
 
-def generate_revision(tool, subject, topic, context, language):
-    instructions = {
-        "Summary": (
-            "Write a structured study summary with headings, key concepts, "
-            "definitions, examples, and a short final recap."
-        ),
-        "Flashcards": (
-            "Create 12 useful flashcards. Format each as "
-            "'Q: ...' followed by 'A: ...'. Cover different difficulty levels."
-        ),
-        "Quiz": (
-            "Create 10 multiple-choice questions with four options each. "
-            "Mark the correct answer and explain why it is correct."
-        ),
-        "Exam questions": (
-            "Create 10 exam-style questions of mixed short-answer and "
-            "long-answer difficulty. Include a concise model answer and "
-            "marks for each question."
-        ),
-        "Mind map": (
-            "Create a hierarchical text mind map using indentation, "
-            "branches and arrows. Group related concepts together."
-        ),
-        "Key points": (
-            "Extract the 15 most important facts, definitions, formulas "
-            "or principles. Do not add unsupported facts."
-        ),
-    }
+    if not check_password(password, user["password_hash"]):
+        return None, "Invalid username or password."
 
-    return call_ai(
-        system_prompt=(
-            "You are an accurate academic revision assistant. Base answers "
-            "on the supplied study material. If information is missing, "
-            "say so instead of inventing facts. Use clear Markdown."
-        ),
-        user_prompt=(
-            f"Subject: {subject}\nTopic: {topic}\n"
-            f"Output language: {language}\n"
-            f"Task: {instructions[tool]}\n\n"
-            f"Study material:\n{context[:18000]}"
-        ),
-        temperature=0.35,
-        max_tokens=2500,
-    )
+    if not user["verified"]:
+        st.session_state.pending_email = user["email"]
+        return None, "Verify your email before logging in."
+
+    return user, ""
 
 
-# ---------------------------------------------------------
-# MAIN WORKSPACE
-# ---------------------------------------------------------
-
-def workspace(user):
-    st.sidebar.markdown("## 📚 Lecture-to-Revision")
-    st.sidebar.caption(f"Signed in as **{user['username']}**")
-
-    if st.sidebar.button("Log out", use_container_width=True):
-        for key in ["user_id", "active_subject", "active_topic"]:
-            st.session_state.pop(key, None)
-        st.rerun()
-
-    page = st.sidebar.radio(
-        "Workspace",
-        [
-            "Dashboard",
-            "Study materials",
-            "Ask AI",
-            "Revision studio",
-            "YouTube finder",
-            "Progress",
-        ],
-    )
-
+def show_auth():
     st.markdown(
-        """
-        <div class="hero">
-          <div class="hero-kicker">Your learning workspace</div>
-          <div class="hero-title">Make every lecture count.</div>
-          <div class="hero-subtitle">
-            Upload course materials, ask focused questions, and build a
-            revision system around your subjects.
-          </div>
-        </div>
-        """,
+        f"<div class='hero'><h1>📚 {APP_NAME}</h1>"
+        "<p class='muted'>Turn lectures into effective revision materials.</p>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        subject = st.text_input(
-            "Subject",
-            value=st.session_state.get("active_subject", ""),
-            placeholder="e.g. Computer Networks",
-        )
-    with col2:
-        topic = st.text_input(
-            "Topic",
-            value=st.session_state.get("active_topic", ""),
-            placeholder="e.g. TCP congestion control",
-        )
+    tabs = st.tabs([
+        "Log in", "Create account", "Verify email", "Forgot password"
+    ])
 
-    subject = subject.strip()
-    topic = topic.strip()
+    # ---------------- LOGIN ----------------
+    with tabs[0]:
+        st.subheader("Welcome back")
 
-    if subject and topic:
-        st.session_state.active_subject = subject
-        st.session_state.active_topic = topic
-    else:
-        st.info("Enter a subject and topic to start a study session.")
-
-    ready = bool(subject and topic)
-
-    if page == "Dashboard":
-        with db() as conn:
-            material_count = conn.execute(
-                "SELECT COUNT(*) FROM materials WHERE user_id=?",
-                (user["id"],),
-            ).fetchone()[0]
-            chat_count = conn.execute(
-                "SELECT COUNT(*) FROM chats WHERE user_id=?",
-                (user["id"],),
-            ).fetchone()[0]
-            progress_count = conn.execute(
-                "SELECT COUNT(*) FROM study_progress WHERE user_id=?",
-                (user["id"],),
-            ).fetchone()[0]
-
-        a, b, c = st.columns(3)
-        for col, value, label in [
-            (a, material_count, "Saved materials"),
-            (b, chat_count, "Chat messages"),
-            (c, progress_count, "Revision activities"),
-        ]:
-            with col:
-                st.markdown(
-                    f'<div class="metric"><h2>{value}</h2>'
-                    f'<div class="muted">{label}</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-        st.subheader("A simple study workflow")
-        st.markdown(
-            """
-            <div class="panel">
-            <b>01 · Add materials</b><br>
-            Upload a PDF or import a YouTube transcript.
-            <hr>
-            <b>02 · Ask questions</b><br>
-            Search your own materials with semantic and keyword retrieval.
-            <hr>
-            <b>03 · Practice retrieval</b><br>
-            Generate flashcards, quizzes, summaries and exam-style questions.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    elif page == "Study materials":
-        if not ready:
-            return
-
-        st.subheader("Add learning materials")
-        st.caption("Extracted text is saved to your account's local database.")
-
-        mode = st.radio(
-            "Source",
-            ["Upload PDF", "YouTube URLs"],
-            horizontal=True,
-        )
-
-        if mode == "Upload PDF":
-            uploads = st.file_uploader(
-                "Choose PDF files",
-                type=["pdf"],
-                accept_multiple_files=True,
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input(
+                "Password",
+                type="password",
+                max_chars=8,
             )
-            if st.button("Import PDF files", type="primary"):
-                if not uploads:
-                    st.warning("Choose at least one PDF.")
-                else:
-                    successes = 0
-                    for uploaded in uploads:
-                        try:
-                            content = extract_pdf_text(uploaded)
-                            if not content:
-                                st.warning(
-                                    f"No selectable text found in {uploaded.name}. "
-                                    "Scanned PDFs need OCR before importing."
-                                )
-                                continue
-                            save_material(
-                                user["id"], subject, topic, "PDF",
-                                uploaded.name, content
-                            )
-                            successes += 1
-                        except Exception as exc:
-                            st.error(f"{uploaded.name}: {exc}")
-                    if successes:
-                        add_progress(
-                            user["id"], subject, topic,
-                            "Imported PDF", details=f"{successes} file(s)"
-                        )
-                        st.success(f"Imported {successes} PDF file(s).")
-                        st.rerun()
-
-        else:
-            urls_text = st.text_area(
-                "Paste up to five YouTube video URLs",
-                placeholder="https://www.youtube.com/watch?v=...\n"
-                            "https://youtu.be/...",
-                height=130,
-            )
-            if st.button("Import transcripts", type="primary"):
-                urls = [
-                    line.strip() for line in urls_text.splitlines()
-                    if line.strip()
-                ]
-                if not urls:
-                    st.warning("Enter at least one video URL.")
-                elif len(urls) > 5:
-                    st.error("Please import no more than five videos at once.")
-                else:
-                    imported = 0
-                    for url in urls:
-                        try:
-                            transcript = fetch_youtube_transcript(url)
-                            save_material(
-                                user["id"], subject, topic, "YouTube",
-                                url, transcript
-                            )
-                            imported += 1
-                        except Exception as exc:
-                            st.warning(f"{url}: {exc}")
-                    if imported:
-                        add_progress(
-                            user["id"], subject, topic,
-                            "Imported transcripts", details=f"{imported} video(s)"
-                        )
-                        st.success(f"Imported {imported} transcript(s).")
-                        st.rerun()
-
-        st.subheader("Saved materials for this topic")
-        materials = load_materials(user["id"], subject, topic)
-        if not materials:
-            st.info("No materials have been added to this topic yet.")
-        for item in materials:
-            with st.expander(
-                f"{item['source_type']} · {item['source_name'][:100]}"
-            ):
-                st.caption(f"Added {item['created_at']}")
-                st.write(item["content"][:1500] + (
-                    "…" if len(item["content"]) > 1500 else ""
-                ))
-                if st.button(
-                    "Delete material",
-                    key=f"delete_material_{item['id']}",
-                ):
-                    delete_material(user["id"], item["id"])
-                    st.rerun()
-
-    elif page == "Ask AI":
-        if not ready:
-            return
-
-        materials = load_materials(user["id"], subject, topic)
-        if not materials:
-            st.warning("Add a PDF or YouTube transcript before asking questions.")
-            return
-
-        chunks = []
-        for material in materials:
-            for chunk in split_chunks(material["content"]):
-                chunks.append(
-                    f"Source: {material['source_name']}\n{chunk}"
-                )
-
-        st.subheader("Ask questions about your materials")
-        st.caption(
-            f"{len(materials)} source(s) · {len(chunks)} searchable text chunks"
-        )
-
-        history = load_chat(user["id"], subject, topic)
-        for row in history:
-            with st.chat_message(
-                row["role"] if row["role"] in ("user", "assistant") else "assistant"
-            ):
-                st.markdown(row["message"])
-
-        question = st.chat_input("Ask a question about your study materials…")
-        if question:
-            save_chat(user["id"], subject, topic, "user", question)
-            with st.chat_message("user"):
-                st.markdown(question)
-
-            with st.chat_message("assistant"):
-                with st.spinner("Searching your materials and preparing an answer…"):
-                    try:
-                        context_chunks = retrieve_context(question, chunks)
-                        context = "\n\n---\n\n".join(context_chunks)
-                        answer = call_ai(
-                            system_prompt=(
-                                "You are a careful academic tutor. Answer using "
-                                "the provided excerpts first. Cite sources by "
-                                "their source name where possible. Clearly state "
-                                "when the excerpts do not contain the answer. "
-                                "Do not fabricate citations."
-                            ),
-                            user_prompt=(
-                                f"Subject: {subject}\nTopic: {topic}\n\n"
-                                f"Relevant excerpts:\n{context}\n\n"
-                                f"Question: {question}"
-                            ),
-                        )
-                        st.markdown(answer)
-                        save_chat(
-                            user["id"], subject, topic, "assistant", answer
-                        )
-                        add_progress(
-                            user["id"], subject, topic,
-                            "Asked AI question", details=question[:250]
-                        )
-                    except Exception as exc:
-                        st.error(f"Could not generate an answer: {exc}")
-
-    elif page == "Revision studio":
-        if not ready:
-            return
-
-        materials = load_materials(user["id"], subject, topic)
-        if not materials:
-            st.warning("Import study materials before generating revision content.")
-            return
-
-        language = st.selectbox(
-            "Output language",
-            ["English", "Hindi", "Bilingual (Hindi + English)"],
-        )
-        tool = st.selectbox(
-            "What would you like to create?",
-            [
-                "Summary",
-                "Flashcards",
-                "Quiz",
-                "Exam questions",
-                "Mind map",
-                "Key points",
-            ],
-        )
-
-        if st.button("Generate revision content", type="primary"):
-            all_chunks = []
-            for item in materials:
-                all_chunks.extend(split_chunks(item["content"]))
-
-            with st.spinner(f"Creating your {tool.lower()}…"):
-                try:
-                    query = f"{tool} for {subject}, topic {topic}"
-                    selected = retrieve_context(query, all_chunks, top_k=8)
-                    context = "\n\n".join(selected)
-                    output = generate_revision(
-                        tool, subject, topic, context, language
-                    )
-                    st.session_state.last_revision = {
-                        "subject": subject,
-                        "topic": topic,
-                        "tool": tool,
-                        "output": output,
-                    }
-                    add_progress(
-                        user["id"], subject, topic, tool,
-                        details=f"Generated {tool}"
-                    )
-                except Exception as exc:
-                    st.error(f"Could not generate content: {exc}")
-
-        result = st.session_state.get("last_revision")
-        if result and result["subject"] == subject and result["topic"] == topic:
-            st.markdown("---")
-            st.subheader(result["tool"])
-            st.markdown(result["output"])
-            st.download_button(
-                "Download revision notes",
-                data=result["output"],
-                file_name=(
-                    f"{re.sub(r'[^A-Za-z0-9_-]+', '_', subject)}_"
-                    f"{re.sub(r'[^A-Za-z0-9_-]+', '_', topic)}_"
-                    f"{result['tool'].lower().replace(' ', '_')}.md"
-                ),
-                mime="text/markdown",
+            submitted = st.form_submit_button(
+                "Log in", use_container_width=True
             )
 
-    elif page == "YouTube finder":
-        st.subheader("Discover related lectures")
-        search_query = st.text_input(
-            "Search topic",
-            value=f"{subject} {topic}".strip() if ready else "",
-        )
-        count = st.slider("Number of videos", 3, 10, 5)
-
-        if st.button("Find videos", type="primary"):
+        if submitted:
             try:
-                with st.spinner("Searching YouTube…"):
-                    results = search_youtube_videos(search_query, count)
-                st.session_state.youtube_results = results
+                user, error = authenticate(username, password)
+                if user:
+                    st.session_state.user = dict(user)
+                    st.rerun()
+                else:
+                    st.error(error)
             except Exception as exc:
                 st.error(str(exc))
 
-        for video in st.session_state.get("youtube_results", []):
-            with st.container(border=True):
-                st.markdown(f"### [{video['title']}]({video['url']})")
-                st.caption(f"Channel: {video['channel']}")
-                st.write(
-                    f"Views: {video['views']:,} · "
-                    f"Likes: {video['likes']:,} · "
-                    f"Comments: {video['comments']:,}"
+    # ---------------- REGISTER ----------------
+    with tabs[1]:
+        st.subheader("Create your account")
+
+        with st.form("register_form"):
+            username = st.text_input(
+                "Username",
+                help="3–30 characters: letters, digits, . _ -",
+            )
+            email = st.text_input("Email address")
+
+            password = st.text_input(
+                "Password (maximum 8 characters)",
+                type="password",
+                max_chars=8,
+            )
+            confirm = st.text_input(
+                "Confirm password",
+                type="password",
+                max_chars=8,
+            )
+
+            st.caption(
+                "Password limit: 8 characters. Short passwords are less secure."
+            )
+
+            submitted = st.form_submit_button(
+                "Create account", use_container_width=True
+            )
+
+        if submitted:
+            try:
+                register_account(username, email, password, confirm)
+                st.success(
+                    "Account created. Check your email for the verification code."
                 )
-                st.write(video["description"][:350])
-                if ready and st.button(
-                    "Import transcript",
-                    key="import_" + video["url"],
-                ):
-                    try:
-                        transcript = fetch_youtube_transcript(video["url"])
-                        save_material(
-                            user["id"], subject, topic, "YouTube",
-                            video["url"], transcript
-                        )
-                        add_progress(
-                            user["id"], subject, topic,
-                            "Imported transcript", details=video["title"]
-                        )
-                        st.success("Transcript saved to this topic.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Could not import transcript: {exc}")
+                st.info("Open the Verify email tab to enter your code.")
+            except sqlite3.IntegrityError:
+                st.error("Username or email is already registered.")
+            except Exception as exc:
+                st.error(str(exc))
 
-    elif page == "Progress":
-        with db() as conn:
-            rows = conn.execute(
-                """
-                SELECT subject, topic, activity_type, score, details, created_at
-                FROM study_progress
-                WHERE user_id=?
-                ORDER BY id DESC LIMIT 100
-                """,
-                (user["id"],),
-            ).fetchall()
+    # ---------------- VERIFY EMAIL ----------------
+    with tabs[2]:
+        st.subheader("Verify your email")
 
-        st.subheader("Your recent study activity")
-        if not rows:
-            st.info("Your study activity will appear here.")
-        else:
-            for row in rows:
-                with st.container(border=True):
-                    st.markdown(
-                        f"**{row['activity_type']}** · "
-                        f"{row['subject']} / {row['topic']}"
+        default_email = st.session_state.get("pending_email", "")
+        email = st.text_input(
+            "Email address",
+            value=default_email,
+            key="verify_email",
+        )
+
+        if st.button("Send verification code"):
+            try:
+                user = get_user_by_email(email)
+                if not user:
+                    st.error("No account was found for that email.")
+                elif user["verified"]:
+                    st.info("This email is already verified.")
+                else:
+                    create_and_send_otp(email, "verify")
+                    st.success("Verification code sent.")
+            except Exception as exc:
+                st.error(str(exc))
+
+        code = st.text_input(
+            "6-digit verification code",
+            max_chars=6,
+            key="verify_code",
+        )
+
+        if st.button("Verify email"):
+            try:
+                ok, message = verify_otp(email, "verify", code)
+                if ok:
+                    with db() as conn:
+                        conn.execute("""
+                            UPDATE users SET verified=1
+                            WHERE lower(email)=lower(?)
+                        """, (email.strip(),))
+                    st.success("Email verified. You can now log in.")
+                else:
+                    st.error(message)
+            except Exception as exc:
+                st.error(str(exc))
+
+    # ---------------- FORGOT PASSWORD ----------------
+    with tabs[3]:
+        st.subheader("Reset your password")
+
+        email = st.text_input("Registered email", key="reset_email")
+
+        if st.button("Send reset code"):
+            try:
+                user = get_user_by_email(email)
+                if not user:
+                    st.error("No account was found for that email.")
+                elif not user["verified"]:
+                    st.error("Verify your email before resetting the password.")
+                else:
+                    create_and_send_otp(email, "reset")
+                    st.success("Reset code sent to your email.")
+            except Exception as exc:
+                st.error(str(exc))
+
+        reset_code = st.text_input(
+            "6-digit reset code",
+            max_chars=6,
+            key="reset_code",
+        )
+        new_password = st.text_input(
+            "New password (maximum 8 characters)",
+            type="password",
+            max_chars=8,
+            key="new_password",
+        )
+        confirm_new = st.text_input(
+            "Confirm new password",
+            type="password",
+            max_chars=8,
+            key="confirm_new_password",
+        )
+
+        if st.button("Reset password"):
+            try:
+                valid, message = validate_password(new_password)
+                if not valid:
+                    raise ValueError(message)
+
+                valid, message = validate_password(confirm_new)
+                if not valid:
+                    raise ValueError(message)
+
+                if new_password != confirm_new:
+                    raise ValueError("Passwords do not match.")
+
+                ok, message = verify_otp(email, "reset", reset_code)
+                if not ok:
+                    raise ValueError(message)
+
+                with db() as conn:
+                    conn.execute("""
+                        UPDATE users SET password_hash=?
+                        WHERE lower(email)=lower(?)
+                    """, (hash_password(new_password), email.strip()))
+
+                st.success("Password reset successfully. You can now log in.")
+            except Exception as exc:
+                st.error(str(exc))
+
+
+# ============================================================
+# AI REVISION WORKSPACE
+# ============================================================
+
+def require_source():
+    source = st.session_state.source_text.strip()
+    if not source:
+        st.warning("Upload a PDF or retrieve a YouTube transcript first.")
+        return None
+    return source
+
+
+def generate_revision(kind, subject, topic, language, source):
+    instructions = {
+        "Summary": (
+            "Create clear, structured revision notes. Include key concepts, "
+            "definitions, examples, and a concise final recap."
+        ),
+        "Flashcards": (
+            "Create 12 useful flashcards in Question / Answer format. "
+            "Keep answers concise and based on the source."
+        ),
+        "Quiz": (
+            "Create 10 multiple-choice questions. Give four options per "
+            "question and show the correct answer with a short explanation."
+        ),
+        "Exam Questions": (
+            "Create important exam-style questions, mixing short answers "
+            "and long answers. Provide model answers and mark-worthy points."
+        ),
+        "Mind Map": (
+            "Create a hierarchical text mind map using headings, indentation, "
+            "and arrows to show relationships between concepts."
+        ),
+        "Key Points": (
+            "Extract the most important facts, terms, formulas, and concepts "
+            "as a well-organized checklist."
+        ),
+        "Translate": (
+            "Translate and explain the source content in the requested language "
+            "while preserving technical terminology and meaning."
+        ),
+    }
+
+    prompt = f"""
+Subject: {subject or "General"}
+Topic: {topic or "Not specified"}
+Output language: {language}
+Task: {kind}
+
+Instructions:
+{instructions.get(kind, "Explain the source accurately.")}
+
+Use the supplied material as the main source. Do not invent facts.
+If the material does not contain enough information, state that clearly.
+
+SOURCE MATERIAL:
+{source[:24000]}
+"""
+    return ai_generate(prompt)
+
+
+def show_workspace():
+    user = st.session_state.user
+
+    st.markdown(
+        f"<div class='hero'><h1>Welcome, {user['username']} 👋</h1>"
+        "<p class='muted'>Your personal AI-powered revision workspace.</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.title("📚 Revision Menu")
+        st.write(f"Signed in as **{user['username']}**")
+        page = st.radio(
+            "Navigate",
+            [
+                "Learning workspace",
+                "AI revision tools",
+                "Ask your lecture",
+                "My history",
+                "Account",
+            ],
+        )
+
+        st.divider()
+
+        if st.button("Log out", use_container_width=True):
+            st.session_state.user = None
+            st.session_state.messages = []
+            st.rerun()
+
+    if page == "Learning workspace":
+        show_learning_workspace()
+
+    elif page == "AI revision tools":
+        show_revision_tools()
+
+    elif page == "Ask your lecture":
+        show_chat()
+
+    elif page == "My history":
+        show_history()
+
+    elif page == "Account":
+        st.subheader("Account details")
+        st.write("**Username:**", user["username"])
+        st.write("**Email:**", user["email"])
+        st.write(
+            "**Email verified:**",
+            "Yes" if user["verified"] else "No",
+        )
+
+
+def show_learning_workspace():
+    st.header("Learning workspace")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        subject = st.text_input(
+            "Subject",
+            key="learning_subject",
+            placeholder="e.g. Computer Networks",
+        )
+
+    with col2:
+        topic = st.text_input(
+            "Topic",
+            key="learning_topic",
+            placeholder="e.g. TCP/IP",
+        )
+
+    language = st.selectbox(
+        "Output language",
+        ["English", "Hindi", "Marathi", "Spanish", "French"],
+        key="learning_language",
+    )
+
+    source_type = st.radio(
+        "Choose your learning material",
+        ["PDF", "YouTube"],
+        horizontal=True,
+    )
+
+    if source_type == "PDF":
+        uploaded = st.file_uploader(
+            "Upload lecture PDF",
+            type=["pdf"],
+            key="lecture_pdf",
+        )
+
+        if uploaded and st.button("Extract PDF text"):
+            try:
+                with st.spinner("Reading PDF..."):
+                    text = extract_pdf(uploaded)
+
+                if not text.strip():
+                    st.error(
+                        "No selectable text was found. Scanned PDFs need OCR."
                     )
-                    if row["details"]:
-                        st.caption(row["details"])
-                    st.caption(row["created_at"])
+                else:
+                    st.session_state.source_text = text
+                    st.session_state.source_name = uploaded.name
+                    st.success(
+                        f"Extracted text from PDF ({len(text):,} characters)."
+                    )
+            except Exception as exc:
+                st.error(f"Could not read PDF: {exc}")
+
+    else:
+        youtube_url = st.text_input(
+            "YouTube video URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+        )
+        transcript_language = st.selectbox(
+            "Transcript language",
+            ["en", "hi", "mr"],
+            key="transcript_language",
+        )
+
+        if st.button("Get YouTube transcript"):
+            try:
+                with st.spinner("Retrieving transcript..."):
+                    text = extract_youtube_transcript(
+                        youtube_url, transcript_language
+                    )
+
+                st.session_state.source_text = text
+                st.session_state.source_name = youtube_url
+                st.success(
+                    f"Transcript retrieved ({len(text):,} characters)."
+                )
+            except Exception as exc:
+                st.error(str(exc))
+
+    if st.session_state.source_text:
+        st.divider()
+        st.subheader("Loaded material")
+        st.caption(st.session_state.source_name)
+        chunks = split_chunks(st.session_state.source_text)
+
+        st.write(
+            f"Characters: {len(st.session_state.source_text):,} "
+            f"| Text chunks: {len(chunks)}"
+        )
+
+        with st.expander("Preview extracted text"):
+            st.text(st.session_state.source_text[:6000])
+
+        if st.button("Clear loaded material"):
+            st.session_state.source_text = ""
+            st.session_state.source_name = ""
+            st.rerun()
+
+        st.info(
+            "Material is held in this Streamlit session. Save any generated "
+            "revision output to history if you want to retrieve it later."
+        )
 
 
-# ---------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------
+def show_revision_tools():
+    st.header("AI revision tools")
 
-user = current_user()
+    subject = st.text_input(
+        "Subject",
+        value=st.session_state.get("learning_subject", ""),
+        key="tools_subject",
+    )
+    topic = st.text_input(
+        "Topic",
+        value=st.session_state.get("learning_topic", ""),
+        key="tools_topic",
+    )
+    language = st.selectbox(
+        "Output language",
+        ["English", "Hindi", "Marathi", "Spanish", "French"],
+        key="tools_language",
+    )
 
-if user and user["verified"]:
-    workspace(user)
-else:
-    auth_screen()
+    kind = st.selectbox(
+        "Choose revision output",
+        [
+            "Summary",
+            "Flashcards",
+            "Quiz",
+            "Exam Questions",
+            "Mind Map",
+            "Key Points",
+            "Translate",
+        ],
+    )
+
+    if st.button("Generate revision material", use_container_width=True):
+        source = require_source()
+        if source:
+            try:
+                with st.spinner(f"Generating {kind.lower()}..."):
+                    result = generate_revision(
+                        kind, subject, topic, language, source
+                    )
+
+                st.session_state.generated_result = result
+                st.session_state.generated_kind = kind
+
+                save_revision(
+                    st.session_state.user["id"],
+                    subject,
+                    topic,
+                    kind,
+                    result,
+                )
+                st.success("Revision material generated and saved to history.")
+
+            except Exception as exc:
+                st.error(f"Generation failed: {exc}")
+
+    if st.session_state.get("generated_result"):
+        st.divider()
+        st.subheader(
+            st.session_state.get("generated_kind", "Revision material")
+        )
+        st.markdown(st.session_state.generated_result)
+
+        st.download_button(
+            "Download revision material",
+            data=st.session_state.generated_result,
+            file_name="revision_material.md",
+            mime="text/markdown",
+        )
+
+
+def show_chat():
+    st.header("Ask your lecture")
+
+    source = st.session_state.source_text.strip()
+    if not source:
+        st.info("Load a PDF or YouTube transcript in the Learning workspace first.")
+        return
+
+    for item in st.session_state.messages:
+        with st.chat_message(item["role"]):
+            st.markdown(item["content"])
+
+    question = st.chat_input("Ask a question about your lecture...")
+
+    if question:
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question,
+        })
+
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        prompt = f"""
+Answer the student's question using the lecture material below.
+If the answer is not supported by the lecture, say so.
+Be clear and educational.
+
+QUESTION:
+{question}
+
+LECTURE MATERIAL:
+{source[:24000]}
+"""
+        try:
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    answer = ai_generate(prompt)
+                st.markdown(answer)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+            })
+
+            save_chat(
+                st.session_state.user["id"],
+                question,
+                answer,
+            )
+
+        except Exception as exc:
+            st.error(f"Could not answer the question: {exc}")
+
+
+def show_history():
+    st.header("My revision history")
+
+    user_id = st.session_state.user["id"]
+    revisions = get_revisions(user_id)
+
+    st.subheader("Generated revision materials")
+
+    if not revisions:
+        st.info("You haven't saved any revision materials yet.")
+    else:
+        for row in revisions:
+            title = (
+                f"{row['kind']} — {row['topic'] or row['subject'] or 'General'}"
+                f" — {row['created_at']}"
+            )
+            with st.expander(title):
+                st.markdown(row["content"])
+                st.download_button(
+                    "Download",
+                    data=row["content"],
+                    file_name=f"revision_{row['id']}.md",
+                    mime="text/markdown",
+                    key=f"download_revision_{row['id']}",
+                )
+
+    st.divider()
+    st.subheader("Previous chat conversations")
+
+    chats = get_chats(user_id)
+
+    if not chats:
+        st.info("No saved chat conversations yet.")
+    else:
+        for row in chats:
+            with st.expander(
+                f"{row['created_at']} — {row['question'][:90]}"
+            ):
+                st.markdown("**Question**")
+                st.write(row["question"])
+                st.markdown("**Answer**")
+                st.markdown(row["answer"])
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    if st.session_state.user is None:
+        show_auth()
+    else:
+        show_workspace()
+
+
+if __name__ == "__main__":
+    main()

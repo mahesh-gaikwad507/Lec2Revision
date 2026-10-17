@@ -1,112 +1,96 @@
-            st.download_button(
-                "Download as Markdown",
-                data=result,
-                file_name=f"{re.sub(r'[^a-zA-Z0-9_-]+','_',st.session_state.get('latest_topic','revision'))}.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-            with st.expander("Translate this output"):
-                target = st.selectbox("Translate to", ["Hindi", "Marathi", "English", "Gujarati", "Tamil", "Telugu", "Bengali", "French", "Spanish"], key="translate_target")
-                if st.button("Translate output"):
-                    with st.spinner("Translating..."):
-                        try:
-                            translated = translate_text(result, target)
-                            st.session_state["translated_output"] = translated
-                        except Exception as exc:
-                            st.error(str(exc))
-                if st.session_state.get("translated_output"):
-                    st.markdown(st.session_state["translated_output"])
-                    st.download_button("Download translation", st.session_state["translated_output"], file_name="translated_revision.md", mime="text/markdown")
+"""
+Lecture-to-Revision AI — Streamlit single-file app
+=================================================
+Run:
+    streamlit run app.py
 
-    elif page == "Ask your lecture":
-        st.subheader("💬 Ask questions about your learning material")
-        source_text = st.session_state.get("source_text", "")
-        if not source_text:
-            st.info("First load source material on the Create revision material page.")
-        else:
-            st.caption(f"Current source: {st.session_state.get('source_name', 'Learning material')}")
-            with db_connect() as conn:
-                prior = conn.execute(
-                    "SELECT role,message FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT 12",
-                    (user_id,),
-                ).fetchall()
-            for item in reversed(prior):
-                with st.chat_message("user" if item["role"] == "user" else "assistant"):
-                    st.markdown(item["message"])
-            question = st.chat_input("Ask a question about your lecture...")
-            if question:
-                subject = st.session_state.get("latest_subject", "")
-                topic = st.session_state.get("latest_topic", "")
-                save_chat(user_id, subject, topic, "user", question)
-                context = build_context(question, source_text)
-                prompt = (
-                    f"Answer the student's question using the context below. If the answer is not in the context, "
-                    f"say what is missing. Give a clear explanation and cite short quoted phrases from the context when useful.\n\n"
-                    f"QUESTION: {question}\n\nCONTEXT:\n{context}"
-                )
-                with st.chat_message("user"):
-                    st.markdown(question)
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        try:
-                            answer = ai_generate(prompt, "You are a patient tutor. Ground answers in the supplied lecture.", 0.2)
-                            st.markdown(answer)
-                            save_chat(user_id, subject, topic, "assistant", answer)
-                        except Exception as exc:
-                            st.error(str(exc))
+Optional Streamlit secrets (.streamlit/secrets.toml):
+    OPENROUTER_API_KEY = "your-key"
+    OPENROUTER_MODEL = "openai/gpt-4o-mini"
+    SMTP_HOST = "smtp.gmail.com"
+    SMTP_PORT = 587
+    SMTP_USERNAME = "your-email@gmail.com"
+    SMTP_PASSWORD = "your-app-password"
+    SMTP_FROM = "your-email@gmail.com"
+    # For local development only; leave false in production:
+    DEV_SHOW_OTP = true
 
-    elif page == "My history":
-        st.subheader("🗂️ Your generated revision history")
-        rows = load_history(user_id)
-        if not rows:
-            st.info("No generated material yet. Create your first revision set.")
-        else:
-            for idx, row in enumerate(rows):
-                label = f"{row['content_type']} — {row['subject'] or 'No subject'} / {row['topic'] or 'No topic'}"
-                with st.expander(label):
-                    st.caption(f"{row['created_at']} · Language: {row['language'] or 'English'}")
-                    st.markdown(row["content"])
-                    st.download_button(
-                        "Download",
-                        data=row["content"],
-                        file_name=f"revision_{idx + 1}.md",
-                        mime="text/markdown",
-                        key=f"history_download_{idx}",
-                    )
+OTP hashing intentionally does not use OTP_PEPPER, as requested.
+The app uses the existing database path in Colab when it exists.
+"""
 
-    elif page == "Dashboard":
-        st.subheader("📈 Learning dashboard")
-        rows = load_history(user_id, limit=1000)
-        total = len(rows)
-        subjects = len({row["subject"] for row in rows if row["subject"]})
-        topics = len({row["topic"] for row in rows if row["topic"]})
-        a, b, c = st.columns(3)
-        a.metric("Generated resources", total)
-        b.metric("Subjects explored", subjects)
-        c.metric("Topics revised", topics)
-        if rows:
-            st.markdown("#### Recent activity")
-            for row in rows[:10]:
-                st.markdown(
-                    f"- **{row['content_type']}** — {row['subject'] or 'Subject'} / "
-                    f"{row['topic'] or 'Topic'} · {row['created_at']}"
-                )
-        else:
-            st.info("Your dashboard will populate after you generate revision material.")
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import random
+import re
+import secrets
+import smtplib
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Any
+
+import streamlit as st
+
+# Optional packages are imported only where needed, so the app can still start
+# when an optional feature dependency has not been installed.
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except Exception:
+    YouTubeTranscriptApi = None
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
 
 
-def main():
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-    if st.session_state["authenticated"]:
-        main_app()
-    else:
-        auth_screen()
-    st.markdown(
-        "<p class='small-note' style='text-align:center'>Lecture-to-Revision AI · Keep your API keys private.</p>",
-        unsafe_allow_html=True,
-    )
+# ----------------------------- Configuration -----------------------------
 
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_DB = Path("/content/lecture_to_revision/lecture_revision.db")
+DB_PATH = Path(os.getenv("LECTURE_REVISION_DB", str(DEFAULT_DB if DEFAULT_DB.parent.exists() else APP_DIR / "lecture_revision.db")))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-if __name__ == "__main__":
-    main()
+st.set_page_config(
+    page_title="Lecture to Revision AI",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+      :root { color-scheme: light; }
+      .stApp { background: linear-gradient(135deg,#f7f9ff 0%,#eef4ff 52%,#f8f5ff 100%); }
+      [data-testid="stSidebar"] { background: #101b35; }
+      [data-testid="stSidebar"] * { color: #f5f7ff !important; }
+      .hero { padding: 1.35rem 1.5rem; border-radius: 20px;
+        background: linear-gradient(120deg,#1e3a8a,#6d28d9); color: white;
+        margin-bottom: 1rem; box-shadow: 0 12px 30px rgba(40,50,110,.16); }
+      .hero h1 { color:white; margin:0; }
+      .hero p { color:#e8eaff; margin:.4rem 0 0 0; }
+      .metric-card { padding: 1rem; border-radius: 16px; background:white;
+        border:1px solid #e1e8fb; box-shadow:0 5px 18px rgba(30,58,138,.06); }
+      div.stButton > button { border-radius: 10px; font-weight: 600; }
+      .small-note { color:#64748b; font-size:.88rem; }
+    </style>

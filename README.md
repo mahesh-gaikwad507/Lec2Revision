@@ -1,62 +1,90 @@
-# Lecture-to-Revision AI 🎓
+# Lecture-to-Revision AI
 
-An AI-powered study assistant that converts YouTube lectures and PDF documents into revision material.
+A Streamlit learning assistant that turns PDFs and YouTube transcripts
+into summaries, question-answering sessions, flashcards, quizzes,
+exam-style questions, and mind maps.
 
 ## Features
 
-- Import YouTube transcripts
-- Upload text-based PDF documents
-- Ask questions about study material using OpenRouter
-- Generate structured revision notes
-- Create interactive flashcards
-- Generate multiple-choice quizzes
-- Support English, Hindi, and Marathi responses
-- Download revision notes as Markdown
-- Dark-themed Streamlit interface
+- Email verification with six-digit OTP
+- Password hashing and password reset
+- Subject- and topic-based learning workspaces
+- PDF text extraction
+- YouTube transcript import
+- YouTube video discovery and engagement statistics
+- Semantic retrieval using Sentence Transformers and FAISS
+- Keyword retrieval using BM25
+- AI answers and revision content using OpenRouter
+- Persistent SQLite storage for accounts, materials, chats, and progress
+- Markdown download for generated revision notes
 
-## Technology Stack
+## Requirements
 
-- Python
-- Streamlit
-- OpenRouter API
-- SQLite
-- YouTube Transcript API
-- PyMuPDF
+- Python 3.10 or newer
+- OpenRouter API key
+- SMTP credentials for email verification and password reset
+- YouTube Data API key for YouTube discovery
 
-## Run Locally
+## Local setup
 
-1. Clone this repository.
-2. Install dependencies:
+1. Create and activate a virtual environment.
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+   Windows:
 
-3. Configure the `OPENROUTER_API_KEY` environment variable.
-4. Start the application:
+       python -m venv .venv
+       .venv\Scripts\activate
 
-   ```bash
-   streamlit run app.py
-   ```
+   macOS/Linux:
 
-## Streamlit Cloud Secrets
+       python -m venv .venv
+       source .venv/bin/activate
 
-Add your API key in the Streamlit Cloud app's Secrets settings:
+2. Install dependencies.
 
-```toml
-OPENROUTER_API_KEY = "your-key"
-OPENROUTER_MODEL = "openai/gpt-4o-mini"
-```
+       pip install -r requirements.txt
 
-Never commit API keys, database files, or personal information.
+3. Create the Streamlit configuration directory.
 
-## Important Notes
+       mkdir .streamlit
 
-- YouTube transcript availability depends on the video and supported languages.
-- Scanned PDFs may require OCR before their text can be extracted.
-- The current app uses lightweight keyword retrieval. Semantic FAISS + BM25 retrieval and persistent cloud storage can be added in a later integration step.
-- Local SQLite files on Streamlit Cloud should not be treated as permanent storage.
+4. Copy `.streamlit/secrets.toml.example` to
+   `.streamlit/secrets.toml`.
 
-## License
+5. Add your real API keys, SMTP credentials, and a random OTP_PEPPER
+   to `.streamlit/secrets.toml`.
 
-Add a license before distributing this project publicly.
+6. Run the application.
+
+       streamlit run app.py
+
+## Persistent data
+
+By default, the SQLite database is stored at:
+
+    data/lecture_revision.db
+
+You can set LTR_DATA_DIR to change the data directory.
+
+Back up the database regularly. Local filesystem storage may not persist
+between deployments on some hosting platforms.
+
+## Deployment
+
+For Streamlit Community Cloud:
+
+1. Push the project files to GitHub.
+2. Create a new app from the repository.
+3. Select `app.py` as the main file.
+4. Configure the API keys and SMTP values in the app's Secrets settings.
+5. Use managed persistent storage or a hosted database if data must survive
+   redeployments and be shared across multiple app instances.
+
+Do not commit `.streamlit/secrets.toml`, passwords, or API keys.
+
+## Limitations
+
+- Scanned PDFs require OCR before their text can be extracted.
+- YouTube transcript import requires accessible captions.
+- FAISS indexes are currently created at query time rather than persisted.
+- Interactive quiz scoring, scheduled flashcard reviews, notifications,
+  and image generation need additional implementation.

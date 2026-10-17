@@ -1,20 +1,33 @@
-# Secrets
-.env
+# Secrets and credentials
 .streamlit/secrets.toml
-secrets.toml
+.env
+.env.*
+!.env.example
 
-# Local databases and user data
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local database and user uploads
+data/
 *.db
 *.sqlite
 *.sqlite3
-app_data/
-database/
+uploads/
 
-# Python and notebook cache
-__pycache__/
-*.py[cod]
-.ipynb_checkpoints/
+# Generated indexes and caches
+cache/
+embeddings/
+vector_store/
+*.faiss
+*.pkl
+*.joblib
 
-# Virtual environments
-.venv/
-venv/
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
